@@ -580,26 +580,62 @@ def test_pool_reconciles_orphans_once_and_not_per_worker(
         pool = OperationWorkerPool(
             database, concurrency=2, artifact_root=tmp_path / "operations"
         )
-        pool.start()
         try:
-            # The pool start reconciled the orphan exactly once...
+            # The pool-level reconcile marks the orphan interrupted...
+            pool.reconcile_startup_orphans()
             assert (
                 repository.get(submitted.operation.id).status
                 == "interrupted"
             )
             # ...and a sibling worker starting later must not re-run the
             # reconciliation: a freshly claimed operation would be marked
-            # interrupted by its own pool.
-            fresh = repository.submit(
+            # interrupted by its own pool. The pool loops stay stopped so
+            # this is deterministic — the worker start itself is the act
+            # under test, and a wrong per-worker reconcile would fire
+            # synchronously before start() returns.
+            claimed = repository.submit(
                 kind="analysis", target_id=_task(database, "/ws/any")
             )
-            claimed = repository.claim_next(worker_id="pool-worker")
-            assert claimed is not None
+            running = repository.claim_next(worker_id="pool-worker")
+            assert running is not None
             pool.workers[1].start()
+            try:
+                assert repository.get(running.id).status == "running"
+                assert claimed.created is True
+            finally:
+                pool.workers[1].stop(timeout=5.0)
+        finally:
+            pool.stop(timeout=5.0)
+        assert not pool.is_running
+    finally:
+        database.dispose()
+
+
+def test_pool_start_reconciles_orphans(
+    migrated_db: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    from kuzya.operation_worker import OperationWorkerPool
+
+    database = Database.from_path(migrated_db)
+    try:
+        repository = OperationRepository(database)
+        submitted = repository.submit(
+            kind=OPERATION_KIND_GIT_COMMIT_PUSH,
+            target_id=_task(database, "/ws/a"),
+        )
+        assert repository.claim_next(worker_id="dead-process") is not None
+
+        pool = OperationWorkerPool(
+            database, concurrency=2, artifact_root=tmp_path / "operations"
+        )
+        pool.start()
+        try:
+            # No queued operations exist, so the live loops cannot race
+            # this assertion: the claim happened before start().
             assert (
-                repository.get(claimed.id).status == "running"
+                repository.get(submitted.operation.id).status
+                == "interrupted"
             )
-            assert fresh.created is True
         finally:
             pool.stop(timeout=5.0)
         assert not pool.is_running
@@ -621,5 +657,90 @@ def test_pool_rejects_out_of_range_concurrency(
                     concurrency=bad,
                     artifact_root=tmp_path / "operations",
                 )
+    finally:
+        database.dispose()
+
+
+# -- commit gate: requires_review must be honored ------------------------
+
+
+def _commit_context(
+    database: Database, tmp_path: pathlib.Path, task_id: str, payload: dict
+) -> object:
+    from kuzya.operation_worker import OperationContext, OperationInstanceContext
+
+    return OperationContext(
+        operation_id="op-gate",
+        kind=OPERATION_KIND_GIT_COMMIT_PUSH,
+        target_id=task_id,
+        input=payload,
+        attempt_count=1,
+        metadata={},
+        instance=OperationInstanceContext(
+            database=database, artifact_root=tmp_path / "operations"
+        ),
+    )
+
+
+def test_commit_operation_blocked_without_approved_review(
+    migrated_db: pathlib.Path,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import MagicMock
+
+    from kuzya.operation_handlers import git_commit_push_handler
+    from kuzya.operation_worker import OperationExecutionError
+    from kuzya.storage import TaskRepository
+
+    database = Database.from_path(migrated_db)
+    try:
+        tasks = TaskRepository(database)
+        task_id = tasks.create(
+            title="gated",
+            workspace="/ws/gate",
+            metadata={"requires_review": True, "changed_files": []},
+        ).id
+
+        # No approved verdict: the operation fails before any git work runs
+        # and the task is not done.
+        with pytest.raises(OperationExecutionError, match="requires review"):
+            git_commit_push_handler(
+                _commit_context(database, tmp_path, task_id, {})
+            )
+        assert tasks.get(task_id).status != "done"
+
+        engine = MagicMock()
+        engine.commit_and_push.return_value = MagicMock(
+            success=True,
+            action="commit_and_push",
+            message="ok",
+            commit_hash="abc123",
+        )
+        monkeypatch.setattr(
+            "kuzya.operation_handlers.GitEngine",
+            MagicMock(return_value=engine),
+        )
+
+        # force=true is the explicit deliberate override.
+        outcome = git_commit_push_handler(
+            _commit_context(database, tmp_path, task_id, {"force": True})
+        )
+        assert outcome["commit_hash"] == "abc123"
+
+        # An approved verdict opens the gate on a fresh task.
+        approved_id = tasks.create(
+            title="approved",
+            workspace="/ws/gate",
+            metadata={"requires_review": True},
+        ).id
+        tasks.update(
+            approved_id,
+            metadata={"review": {"approved": True, "round": 1}},
+        )
+        git_commit_push_handler(
+            _commit_context(database, tmp_path, approved_id, {})
+        )
+        assert tasks.get(approved_id).status == "done"
     finally:
         database.dispose()

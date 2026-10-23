@@ -83,11 +83,33 @@ def _load_task_context(
 def git_commit_push_handler(
     context: OperationContext,
 ) -> dict[str, Any]:
-    """Commit (and optionally push) the task's changes, then mark it done."""
+    """Commit (and optionally push) the task's changes, then mark it done.
+
+    A task with ``requires_review`` may only be committed with a recorded
+    approved verdict (``metadata.review.approved``): the invariant is
+    enforced here, at the transition to ``done``, so neither a missed
+    automatic review nor a manual trigger can slip unreviewed changes
+    through. ``input.force=true`` is the explicit, deliberate override.
+    """
     repository, task_id, task, workspace, changed_files = _load_task_context(
         context, "git.commit_push"
     )
     meta = dict(task.meta or {})
+    review = meta.get("review") if isinstance(meta.get("review"), dict) else {}
+    force = bool(context.input.get("force", False))
+    if bool(meta.get("requires_review")) and not review.get("approved"):
+        if not force:
+            raise OperationExecutionError(
+                "task requires review but no approved review is recorded "
+                f"(metadata.review.approved={review.get('approved')!r}); "
+                "run the review operation first, or pass input.force=true "
+                "for a deliberate override"
+            )
+        logger.warning(
+            "git.commit_push on task %s forced past an unapproved review",
+            task_id,
+            extra={"event": "commit_forced_past_review", "task_id": task_id},
+        )
     custom_message = str(context.input.get("message") or "").strip() or None
     push = bool(context.input.get("push", True))
     require_ci = bool(context.input.get("require_ci", False))

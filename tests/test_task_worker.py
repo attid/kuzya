@@ -743,6 +743,17 @@ def test_task_worker_run_review_cycle_metrics_and_reload(
     assert res["needs_user_input"] is False
     assert "ОДОБРЕНО" in res["summary"]
 
+    # The automatic verdict must leave the same machine-readable trace the
+    # standalone review operation writes: the secretary instruction and the
+    # commit gate both check metadata.review.approved.
+    stored = task_repo.get(task.id)
+    review = (stored.meta or {}).get("review") or {}
+    assert review["approved"] is True
+    assert review["verdict"] == "approved"
+    assert review["round"] == 1
+    assert review["source"] == "in_worker"
+    assert review["report_path"]
+
     # Verify review metrics persisted
     round_json = tmp_path / "artifacts" / str(task.id) / "review" / "round_1.json"
     assert round_json.is_file()
@@ -1346,6 +1357,38 @@ def test_workspace_note_has_testing_recipe_with_canonical_interpreter(
     assert "Do not commit `.venv`" in note
 
 
+def test_workspace_note_uses_absolute_uv_from_runtime_paths(
+    tmp_path: Path,
+    fake_runner_argv: list[str],
+    setup_developer_agent: tuple[Database, str],
+) -> None:
+    """Bare ``uv`` is not on the sandbox PATH; the recipe must not use it.
+
+    When uv is among the mounted runtime paths, every uv command in the
+    Testing section carries its absolute path instead of the bare name that
+    would fail with "command not found" on the first task.
+    """
+    db, agent_id = setup_developer_agent
+    runtime_dir = tmp_path / "uv-python"
+    _write_executable(runtime_dir / "bin" / "python3.14")
+    uv_path = _write_executable(tmp_path / "uvbin" / "uv")
+    AgentProfileRepository(db).update(
+        agent_id=agent_id,
+        expected_revision=1,
+        runner_config={
+            "mode": "success",
+            "summary_text": "ok",
+            "runtime_paths": [str(runtime_dir), str(uv_path)],
+        },
+    )
+
+    _run_one_task_with_worker(tmp_path, fake_runner_argv, db, agent_id)
+    note = _read_workspace_note(tmp_path)
+
+    assert f"{uv_path} sync --no-install-project" in note
+    assert " uv sync" not in note
+
+
 def test_workspace_note_read_only_recipe_builds_env_under_tmp(
     tmp_path: Path,
     fake_runner_argv: list[str],
@@ -1450,3 +1493,40 @@ def test_resolve_python_interpreter_skips_broken_and_non_python_entries(
 
     explicit = _write_executable(tmp_path / "python3.14")
     assert _resolve_python_interpreter([str(explicit)]) == str(explicit)
+
+
+def test_resolve_python_interpreter_normalizes_symlinks_and_tilde(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sandbox mounts the resolved target, never the alias.
+
+    A symlinked runtime directory or a ``~``-relative entry must resolve to
+    the real mounted path before it is advertised in workspace.md, or the
+    recipe names a path that does not exist inside the sandbox.
+    """
+    real = _write_executable(tmp_path / "real" / "bin" / "python3.14")
+    link = tmp_path / "link"
+    link.symlink_to(tmp_path / "real", target_is_directory=True)
+
+    assert _resolve_python_interpreter([str(link)]) == str(real)
+
+    home = tmp_path / "home"
+    home_python = _write_executable(home / ".local" / "py" / "bin" / "python3.14")
+    monkeypatch.setenv("HOME", str(home))
+
+    assert _resolve_python_interpreter(["~/.local/py"]) == str(home_python)
+
+
+def test_resolve_runtime_executable_finds_named_entry(
+    tmp_path: Path,
+) -> None:
+    """uv is reachable only through its mount point, not the sandbox PATH."""
+    from kuzya.task_worker import _resolve_runtime_executable
+
+    uv = _write_executable(tmp_path / "uvbin" / "uv")
+
+    assert _resolve_runtime_executable([str(uv)], "uv") == str(uv)
+    assert _resolve_runtime_executable([str(tmp_path / "uvbin")], "uv") == str(uv)
+    assert _resolve_runtime_executable([str(tmp_path)], "uv") is None
+    assert _resolve_runtime_executable(None, "uv") is None

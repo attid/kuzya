@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+from datetime import datetime, timezone
 import hashlib
 import json
 import logging
@@ -35,6 +36,7 @@ from .review_executor import (
     ReviewExecutionError,
     ReviewExecutor,
     ReviewRequest,
+    ReviewResult,
 )
 from .storage import (
     AgentProfileRepository,
@@ -73,15 +75,18 @@ def _resolve_python_interpreter(runtime_paths: Any) -> str | None:
     same absolute path in every sandbox, so an interpreter taken from there
     remains valid across executions and sandboxes regardless of HOME. Each
     entry may be the interpreter itself or a directory holding ``bin/python*``.
-    Only existing executables are returned; missing or broken entries are
-    skipped so the caller never advertises a path that cannot be executed.
+    Entries are normalized with ``expanduser``/``resolve`` first: the sandbox
+    mounts the resolved target, so a ``~``-relative entry or a symlink would
+    otherwise advertise a path that does not exist inside it. Only existing
+    executables are returned; missing or broken entries are skipped so the
+    caller never advertises a path that cannot be executed.
     """
     if not isinstance(runtime_paths, (list, tuple)):
         return None
     for raw in runtime_paths:
         if not isinstance(raw, str) or not raw.strip():
             continue
-        entry = Path(raw)
+        entry = Path(raw).expanduser().resolve()
         if entry.is_file():
             candidates = [entry]
         elif entry.is_dir():
@@ -104,13 +109,40 @@ def _resolve_python_interpreter(runtime_paths: Any) -> str | None:
     return None
 
 
+def _resolve_runtime_executable(runtime_paths: Any, name: str) -> str | None:
+    """Absolute path of a named executable among the mounted runtime paths.
+
+    The sandbox PATH only carries the Pi node directory and ``/usr/bin``, so
+    tools like ``uv`` are reachable solely through their mount points. An
+    entry may be the executable itself or a directory holding it.
+    """
+    if not isinstance(runtime_paths, (list, tuple)):
+        return None
+    for raw in runtime_paths:
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        entry = Path(raw).expanduser().resolve()
+        if entry.is_file() and entry.name == name and os.access(entry, os.X_OK):
+            return str(entry)
+        candidate = entry / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
 def _testing_section_lines(
-    interpreter: str | None, *, project_read_only: bool
+    interpreter: str | None,
+    *,
+    project_read_only: bool,
+    uv_command: str = "uv",
 ) -> list[str]:
     """Render the canonical test-running recipe for ``workspace.md``.
 
     An empty list means the role exposes no CPython runtime, so no recipe is
     advertised: a missing interpreter must not turn into a stale or wrong path.
+    ``uv_command`` must be an absolute path resolved from the runtime mounts —
+    bare ``uv`` is not on the sandbox PATH and would fail with "command not
+    found".
 
     When the project is mounted read-only, ``rm -rf .venv`` cannot work and
     would abort the whole recipe at the first ``&&``. The read-only branch
@@ -132,7 +164,7 @@ def _testing_section_lines(
             "- This workspace is mounted read-only, so a stale project `.venv` cannot"
             " be removed or recreated. Create the test environment in the writable"
             f" `/tmp` directory instead: `UV_PROJECT_ENVIRONMENT={READONLY_TEST_ENV_DIR}"
-            f" UV_PYTHON={interpreter} uv sync --frozen --no-install-project`."
+            f" UV_PYTHON={interpreter} {uv_command} sync --frozen --no-install-project`."
             " `--frozen` keeps uv from rewriting the lock file in the read-only"
             " workspace.",
             "- Without uv, create that environment directly:"
@@ -146,7 +178,8 @@ def _testing_section_lines(
     else:
         lines += [
             "- In that case recreate the environment with the canonical interpreter:"
-            f" `rm -rf .venv && UV_PYTHON={interpreter} uv sync --no-install-project`,"
+            f" `rm -rf .venv && UV_PYTHON={interpreter} {uv_command} sync"
+            " --no-install-project`,"
             f" or without uv: `rm -rf .venv && {interpreter} -m venv .venv &&"
             " .venv/bin/python -m pip install -e . pytest`.",
             "- Run the tests as `PYTHONPATH=src .venv/bin/python -m pytest`.",
@@ -1010,11 +1043,14 @@ class TaskExecutionWorker:
                     "Inbox: /inbox (read-only input attachments)",
                     "Use the sandbox paths above. A directory named Project is not automatically added below /workspace.",
                 ]
+                runtime_paths = runner_config.get("runtime_paths")
                 testing_lines = _testing_section_lines(
-                    _resolve_python_interpreter(runner_config.get("runtime_paths")),
+                    _resolve_python_interpreter(runtime_paths),
                     project_read_only=bool(
                         runner_config.get("project_read_only", False)
                     ),
+                    uv_command=_resolve_runtime_executable(runtime_paths, "uv")
+                    or "uv",
                 )
                 if testing_lines:
                     workspace_lines += [""] + testing_lines
@@ -1412,6 +1448,38 @@ class TaskExecutionWorker:
             )
         return merged
 
+    def _record_review_round(self, task: Task, result: ReviewResult) -> None:
+        """Persist one review round as ``metadata.review`` (shallow merge).
+
+        The standalone review operation already writes this record; without
+        the same trace from the in-worker cycle an approved automatic review
+        looks unapproved to the secretary instruction (``metadata.review.
+        approved=true``) and to the commit gate, provoking a redundant
+        standalone review or a refused commit. Later rounds overwrite the
+        key, so the record always reflects the latest verdict. A write
+        failure is logged, never fatal: the cycle's return value still
+        carries the verdict to the caller.
+        """
+        record = {
+            "verdict": result.verdict,
+            "approved": bool(result.approved),
+            "round": result.round_number,
+            "report_path": result.report_path,
+            "metrics_path": result.metrics_path,
+            "findings": [finding.to_dict() for finding in result.findings],
+            "reviewer_agent_id": result.reviewer_agent_id,
+            "source": "in_worker",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            self._repository.update(task.id, metadata={"review": record})
+        except Exception as error:  # noqa: BLE001 - verdict still returned
+            logger.warning(
+                "Could not record metadata.review for task %s: %s",
+                task.id,
+                error,
+            )
+
     def _run_review_cycle(
         self,
         task: Task,
@@ -1498,6 +1566,7 @@ class TaskExecutionWorker:
 
             review_summary = result.report_text
             logger.info("Saved review report for task %s to %s", task.id, result.report_path)
+            self._record_review_round(task, result)
 
             if result.verdict == VERDICT_APPROVED:
                 logger.info("Task %s code review round %d PASSED", task.id, round_num)
