@@ -420,3 +420,51 @@ def test_analysis_and_recommendation_routes_enforce_action_and_resource(
             ).status_code
             == 403
         )
+
+
+# -- unknown paths vs unexposed routes -----------------------------------
+
+
+def _wildcard_call_api_token(permissions: ExecutionPermissions) -> str:
+    """A secretary-shaped grant: ``call_api`` authority, wildcard resources."""
+    return _scoped(
+        permissions,
+        ["call_api", "create_task"],
+        agent_id="system-secretary",
+    )
+
+
+def test_unknown_path_is_a_plain_404_for_execution_tokens(
+    migrated_db: Path,
+) -> None:
+    permissions = ExecutionPermissions()
+    token = _wildcard_call_api_token(permissions)
+    headers = {"Authorization": f"Bearer {token}"}
+    with _client(migrated_db, permissions) as client:
+        # Guessed paths (there is no /tasks/{id}/logs, no bare /sessions)
+        # must be the router's 404, not a misleading scope denial.
+        guessed = client.get("/tasks/some-task-id/logs", headers=headers)
+        assert guessed.status_code == 404
+        bare = client.get("/sessions", headers=headers)
+        assert bare.status_code == 404
+        # The administrative caller sees the same honest 404.
+        assert (
+            client.get(
+                "/tasks/some-task-id/logs", headers=ADMIN_HEADERS
+            ).status_code
+            == 404
+        )
+        # A declared route deliberately unexposed to executions stays 403.
+        assert client.get("/mcp", headers=headers).status_code == 403
+
+
+def test_tasks_counts_is_mapped_for_execution_tokens(
+    migrated_db: Path,
+) -> None:
+    permissions = ExecutionPermissions()
+    token = _wildcard_call_api_token(permissions)
+    headers = {"Authorization": f"Bearer {token}"}
+    with _client(migrated_db, permissions) as client:
+        response = client.get("/tasks/counts", headers=headers)
+        assert response.status_code == 200
+        assert isinstance(response.json(), dict)

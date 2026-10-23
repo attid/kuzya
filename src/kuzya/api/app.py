@@ -49,6 +49,7 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse
 from sqlalchemy.engine import make_url
+from starlette.routing import Match
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ..logging import bind_log_context
@@ -438,6 +439,13 @@ class BearerAuthMiddleware:
 
         requirement = resolve_requirement(method, path)
         if requirement is None:
+            if not self._route_exists(scope):
+                # An unknown path is not a scope question: forward it and
+                # let the router answer a plain 404/405. Reporting it as a
+                # missing scope sent agents hunting for rights they already
+                # had when they had merely guessed the URL.
+                await self.app(scope, receive, send)
+                return
             await self._deny(
                 scope,
                 receive,
@@ -472,6 +480,24 @@ class BearerAuthMiddleware:
 
         _set_execution_grant(scope, grant)
         await self.app(scope, receive, send)
+
+    def _route_exists(self, scope: Scope) -> bool:
+        """Whether the wrapped application declares a route for this request.
+
+        A declared route without a scope rule (``/mcp``, ``/docs``) stays a
+        deliberate 403 for execution credentials; a path no route matches is
+        not an endpoint at all and becomes the router's 404/405 instead of a
+        misleading scope denial. When the route table cannot be reached the
+        strict historic denial is kept.
+        """
+        routes = getattr(scope.get("app"), "routes", None)
+        if not routes:
+            return True
+        for route in routes:
+            match, _child_scope = route.matches(scope)
+            if match is Match.FULL:
+                return True
+        return False
 
     async def _deny(
         self,

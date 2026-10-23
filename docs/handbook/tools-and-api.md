@@ -879,7 +879,14 @@ route with the execution-scoped credential. Its grant is admin-equivalent by
 design (`action="*"` in `src/kuzya/capabilities.py`), and it returns
 `ok`/`applied`/`failed`/`unknown`. Use it for gaps the dedicated tools do not
 cover (task metadata such as `changed_files`, conversations, turns), and read
-state back after a lost write response.
+state back after a lost write response. Paths must be exact endpoints from
+the tables above: an unknown path is a plain `404`, not a permission problem.
+For "what is running right now" use `GET /monitor/executions` (live workers,
+tools, tokens), `GET /tasks/{task_id}/session` (a finished-or-running task's
+session transcript, summary and paths) and `GET /agents/{agent_id}/sessions`
+(runner session ids, never contents). There is **no** `/tasks/{id}/logs`
+endpoint — `get_task_logs` is a JS tool wrapping `GET /tasks/{task_id}`, not
+a REST route.
 
 **Durable operation submissions** (return the operation; inspect it to learn
 the outcome): `trigger_review`, `trigger_analysis`, `trigger_commit_push`,

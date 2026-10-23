@@ -505,7 +505,7 @@ export default function policy(pi) {
   pi.registerTool({
     name: "call_api",
     label: "Call Platform API",
-    description: "Direct platform REST API call for anything the dedicated tools do not cover: editing task metadata (e.g. changed_files), deleting knowledge documents, conversations and turns, any endpoint. method is an HTTP verb, path starts with '/', body is the JSON payload for writes. Idempotency: a lost response on a write does not prove failure - read the state back before retrying.",
+    description: "Direct platform REST API call for anything the dedicated tools do not cover: editing task metadata (e.g. changed_files), deleting knowledge documents, conversations and turns, any endpoint. method is an HTTP verb, path starts with '/', body is the JSON payload for writes. Paths must be exact endpoints from the handbook table - there is no /tasks/{id}/logs; live execution status is GET /monitor/executions, a task's session transcript is GET /tasks/{id}/session, agent runner sessions are GET /agents/{agent_id}/sessions. A made-up path returns 404. Idempotency: a lost response on a write does not prove failure - read the state back before retrying.",
     parameters: Type.Object({
       method: Type.String({ description: "HTTP method: GET, POST, PATCH, PUT or DELETE" }),
       path: Type.String({ description: "API path starting with '/', e.g. '/tasks/41'" }),

@@ -46,6 +46,10 @@
   only to their assigned task (`POST /tasks/{task_id}/attachments`), receiving
   `403 Forbidden` on foreign tasks. `resolve_requirement` maps every declared route, so a
   shell inside a sandbox cannot bypass the tool-exposure policy with `curl`.
+  A path no application route matches is not a scope question: execution
+  credentials receive the router's plain `404` (or `405`) exactly like an
+  administrative caller, never a misleading scope denial. Deliberately
+  unexposed routes that do exist (`/mcp`, `/docs`) stay `403`.
   Operations additionally check the submitted `kind` and `target_id`, and a
   scoped caller can read only its own operations.
 - Issuing the first execution grant never switches a running service from

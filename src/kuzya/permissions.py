@@ -271,6 +271,7 @@ _ROUTE_RULES: tuple[tuple[str, str, str, str | None], ...] = (
     ("POST", "/tasks", TASKS_WRITE, None),
     ("POST", "/imports/tasks", TASKS_WRITE, None),
     ("GET", "/tasks", TASKS_READ, None),
+    ("GET", "/tasks/counts", TASKS_READ, None),
     ("GET", "/monitor/executions", TASKS_READ, None),
     ("GET", "/tasks/{task_id}", TASKS_READ, "task"),
     ("PATCH", "/tasks/{task_id}", TASKS_WRITE, "task"),
