@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -583,6 +584,114 @@ class TaskOutcome:
     worker_id: str | None = None
 
 
+def latest_session_id(state_dir: Path) -> str | None:
+    """Best-effort discovery of the newest runner session under ``state_dir``.
+
+    A manually interrupted runner dies before printing its result JSON, so
+    the session id cannot come from stdout. The newest session directory
+    that still holds a session journal is used instead — the journal is
+    append-only, so a session killed mid-turn stays resumable.
+    """
+    sessions_root = state_dir / "sessions"
+    if not sessions_root.is_dir():
+        return None
+    candidates = sorted(
+        (
+            entry
+            for entry in sessions_root.iterdir()
+            if entry.is_dir() and (entry / "pi" / "session.jsonl").is_file()
+        ),
+        key=lambda entry: (entry / "pi" / "session.jsonl").stat().st_mtime,
+    )
+    return candidates[-1].name if candidates else None
+
+
+class TaskProcessRegistry:
+    """Live handles to running task runner processes, for manual interrupt.
+
+    Each runner is started in its own session (process group), so one signal
+    reaches the pi process and every node or bwrap child it spawned. A
+    request sends SIGTERM to the group and a watchdog escalates to SIGKILL
+    after a grace window, so a wedged child cannot outlive the request by
+    ignoring the polite signal. Thread-safe: workers register from their own
+    loops while the API thread interrupts.
+    """
+
+    def __init__(self, *, term_grace_seconds: float = 5.0) -> None:
+        self._term_grace_seconds = float(term_grace_seconds)
+        self._lock = threading.Lock()
+        self._entries: dict[str, tuple[subprocess.Popen, list]] = {}
+
+    def run_process(
+        self,
+        task_id: str,
+        cmd: Sequence[str],
+        *,
+        cwd: str,
+        env: Mapping[str, str] | None = None,
+    ) -> tuple[subprocess.CompletedProcess, bool]:
+        """Run one runner process to completion, interruptible by task id.
+
+        Returns the completed process (stdout/stderr captured like
+        ``subprocess.run``) and whether an interrupt was requested for it.
+        """
+        process = subprocess.Popen(
+            list(cmd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=cwd,
+            env=dict(env) if env is not None else None,
+            start_new_session=True,
+        )
+        interrupted: list = [False]
+        with self._lock:
+            self._entries[task_id] = (process, interrupted)
+        try:
+            stdout, stderr = process.communicate()
+        finally:
+            with self._lock:
+                self._entries.pop(task_id, None)
+        completed = subprocess.CompletedProcess(
+            list(cmd), process.returncode, stdout, stderr
+        )
+        return completed, bool(interrupted[0])
+
+    def request_interrupt(self, task_id: str) -> bool:
+        """Signal the runner of ``task_id`` to stop. False when not running."""
+        with self._lock:
+            entry = self._entries.get(task_id)
+        if entry is None:
+            return False
+        process, interrupted = entry
+        interrupted[0] = True
+        self._signal_group(process, signal.SIGTERM)
+
+        def _escalate() -> None:
+            time.sleep(self._term_grace_seconds)
+            if process.poll() is None:
+                self._signal_group(process, signal.SIGKILL)
+
+        threading.Thread(
+            target=_escalate,
+            name=f"task-interrupt-{task_id[:8]}",
+            daemon=True,
+        ).start()
+        return True
+
+    def running_task_ids(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(self._entries)
+
+    def _signal_group(self, process: subprocess.Popen, sig: int) -> None:
+        try:
+            os.killpg(os.getpgid(process.pid), sig)
+        except ProcessLookupError:
+            # The process (group) is already gone; the interrupt still
+            # counts as delivered.
+            pass
+
+
 class TaskExecutionWorker:
     """Continuously claims in_progress tasks and executes them via pi_runner."""
 
@@ -603,6 +712,7 @@ class TaskExecutionWorker:
         runtime_defaults: RuntimeDefaultsResolver | None = None,
         instance: InstanceContext | None = None,
         permissions: ExecutionPermissions | None = None,
+        process_registry: TaskProcessRegistry | None = None,
     ) -> None:
         self.database = database
         self.artifact_root = Path(artifact_root)
@@ -621,6 +731,7 @@ class TaskExecutionWorker:
         self.runtime_defaults = runtime_defaults or RuntimeDefaultsResolver()
         self.instance = instance
         self.permissions = permissions
+        self.process_registry = process_registry or TaskProcessRegistry()
 
         self._repository = TaskRepository(database)
         self._agent_repository = AgentProfileRepository(database)
@@ -1014,23 +1125,22 @@ class TaskExecutionWorker:
                     cmd,
                     project_dir,
                 )
-                result = subprocess.run(
+                result, interrupted = self.process_registry.run_process(
+                    task.id,
                     cmd,
-                    capture_output=True,
-                    text=True,
                     cwd=str(project_dir),
                     env=child_env,
-                    check=False,
                 )
 
                 duration_ms = (time.perf_counter() - started) * 1000.0
                 logger.info(
-                    "Runner finished for task %s: returncode=%d duration_ms=%.1f stdout_len=%d stderr_len=%d",
+                    "Runner finished for task %s: returncode=%d duration_ms=%.1f stdout_len=%d stderr_len=%d interrupted=%s",
                     task.id,
                     result.returncode,
                     duration_ms,
                     len(result.stdout),
                     len(result.stderr),
+                    interrupted,
                 )
                 if result.stderr:
                     logger.warning(
@@ -1039,35 +1149,66 @@ class TaskExecutionWorker:
                         result.stderr.strip()[:2000],
                     )
 
-                if result.returncode != 0:
+                if interrupted:
+                    # A manual stop is not a failure: the session journal is
+                    # append-only and stays resumable, so the task lands in
+                    # waiting_for_input with an explicit "what next?"
+                    # clarification instead of a crash diagnostic.
+                    logger.info(
+                        "Task %s interrupted by request; session will be resumable",
+                        task.id,
+                        extra={"event": "task_interrupted", "workspace": ws_name},
+                    )
+                    runner_result = {
+                        "status": "waiting_for_input",
+                        "interrupted": True,
+                        "session_id": latest_session_id(state_dir),
+                        "changed_files": [],
+                        "clarification": {
+                            "title": "Задача остановлена вручную",
+                            "description": (
+                                "Выполнение прервано командой «Остановить». "
+                                "Изменения в рабочей папке не откатаны."
+                            ),
+                            "question": (
+                                "Что делать дальше? Ответьте сообщением — "
+                                "агент продолжит сессию с новыми указаниями."
+                            ),
+                        },
+                    }
+                    status = "waiting_for_input"
+                    summary_text = "Выполнение остановлено вручную."
+                    summary_path = None
+                    changed_files = []
+                elif result.returncode != 0:
                     err_msg = (
                         f"Runner process exited with code {result.returncode}.\n"
                         f"Stderr: {result.stderr[:2000]}\n"
                         f"Stdout: {result.stdout[:1000]}"
                     )
                     raise RuntimeError(err_msg)
+                else:
+                    stdout_clean = result.stdout.strip()
+                    runner_result = extract_runner_result(result.stdout)
+                    if runner_result is None:
+                        raise RuntimeError(
+                            "Failed to parse runner JSON output: no JSON object "
+                            f"found. Stdout: {stdout_clean[:1000]!r}"
+                        )
 
-                stdout_clean = result.stdout.strip()
-                runner_result = extract_runner_result(result.stdout)
-                if runner_result is None:
-                    raise RuntimeError(
-                        "Failed to parse runner JSON output: no JSON object "
-                        f"found. Stdout: {stdout_clean[:1000]!r}"
+                    status = runner_result.get("status")
+                    if status not in ("completed", "waiting_for_input"):
+                        raise RuntimeError(
+                            f"Runner reported status {status!r}: {runner_result.get('errors_path')}"
+                        )
+
+                    summary_path = runner_result.get("summary_path")
+                    summary_text = (
+                        Path(summary_path).read_text(encoding="utf-8")
+                        if summary_path and Path(summary_path).exists()
+                        else ("Требуется уточнение вопроса." if status == "waiting_for_input" else "Задача выполнена.")
                     )
-
-                status = runner_result.get("status")
-                if status not in ("completed", "waiting_for_input"):
-                    raise RuntimeError(
-                        f"Runner reported status {status!r}: {runner_result.get('errors_path')}"
-                    )
-
-                summary_path = runner_result.get("summary_path")
-                summary_text = (
-                    Path(summary_path).read_text(encoding="utf-8")
-                    if summary_path and Path(summary_path).exists()
-                    else ("Требуется уточнение вопроса." if status == "waiting_for_input" else "Задача выполнена.")
-                )
-                changed_files = list(runner_result.get("changed_files") or [])
+                    changed_files = list(runner_result.get("changed_files") or [])
 
                 # Store session details in runner_result for provenance
                 session_id = runner_result.get("session_id")

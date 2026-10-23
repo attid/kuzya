@@ -75,7 +75,10 @@ def _run_worker_with_outbox(
             stderr="",
         )
 
-    monkeypatch.setattr("kuzya.task_worker.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "kuzya.task_worker.TaskProcessRegistry.run_process",
+        lambda self, task_id, cmd, *, cwd, env=None: (fake_run(cmd, cwd=cwd, env=env), False),
+    )
     workspace = tmp_path / "workspace"
     workspace.mkdir(exist_ok=True)
     worker = TaskExecutionWorker(

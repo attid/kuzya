@@ -185,6 +185,23 @@ while allowing different workspaces to run in parallel.
 6. runs the child outside any database transaction and stores summary,
    `changed_files`, errors and provenance.
 
+## Manual stop (interrupt)
+
+`POST /tasks/{task_id}/interrupt` (`tasks.write` on `task:<id>`) requests a
+manual stop of a **running** execution. The API marks
+`metadata.execution_stop_requested_at` and signals the runner's process group
+(SIGTERM, escalating to SIGKILL after a grace window) through the shared
+`TaskProcessRegistry`; the Telegram task card exposes the same action as a
+⏹ button while `execution_status == "running"`.
+
+A manual stop is not a failure: the worker records the task
+`waiting_for_input` with a "stopped manually" clarification and the newest
+resumable session id. Replying to the clarification resumes that session with
+the new instructions (see [Resume a session](#resume-a-session)). Workspace
+changes made before the stop are not rolled back — use the Git rollback
+operation afterwards if needed. There is no automatic timeout: stops happen
+only on request.
+
 ## Internal review cycle
 
 When the task has `changed_files` and review is required (coding tasks by

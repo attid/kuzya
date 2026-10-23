@@ -780,9 +780,16 @@ async def on_select_task(
     await rich_edit_message(
         callback.message,
         "\n".join(card_lines),
-        reply_markup=task_card_keyboard(task["id"], task["status"]),
+        reply_markup=task_card_keyboard(
+            task["id"], task["status"], running=_task_is_running(task)
+        ),
     )
     await callback.answer("Контекст задачи выбран")
+
+
+def _task_is_running(task: Dict[str, Any]) -> bool:
+    """Whether the task's execution is live (the ⏹ stop button condition)."""
+    return (task.get("metadata") or {}).get("execution_status") == "running"
 
 
 async def _bind_task_conversation(
@@ -952,7 +959,9 @@ async def on_switch_task(
         f"Диалог: <code>#{html.escape(conv_id)}</code>\n\n"
         "Обычные сообщения теперь уходят в диалог этой задачи.",
         parse_mode="HTML",
-        reply_markup=task_card_keyboard(task["id"], task["status"]),
+        reply_markup=task_card_keyboard(
+            task["id"], task["status"], running=_task_is_running(task)
+        ),
     )
     await callback.answer("Контекст задачи выбран")
 
@@ -979,9 +988,35 @@ async def on_set_status(
     await rich_edit_message(
         callback.message,
         card_text,
-        reply_markup=task_card_keyboard(task["id"], task["status"]),
+        reply_markup=task_card_keyboard(
+            task["id"], task["status"], running=_task_is_running(task)
+        ),
     )
     await callback.answer(f"Статус изменен на {new_status}")
+
+
+@router.callback_query(F.data.startswith("interrupt_task:"))
+async def on_interrupt_task(
+    callback: CallbackQuery,
+    client: BackendClient,
+) -> None:
+    """Request a manual stop of a running task execution."""
+    task_id = callback.data.split(":", 1)[1]
+    try:
+        await client.interrupt_task(task_id)
+    except Exception as error:
+        await callback.answer(
+            f"Не удалось остановить: {error}", show_alert=True
+        )
+        return
+    await callback.answer("Сигнал остановки отправлен")
+    await rich_edit_message(
+        callback.message,
+        "⏹ **Остановка запрошена.**\n\n"
+        "Процесс завершит текущий ход и выйдет, задача перейдёт в "
+        "«ожидание ввода». Ответьте следующим сообщением, что делать "
+        "дальше — агент продолжит сессию с новыми указаниями.",
+    )
 
 
 @router.callback_query(F.data.startswith("commit_local:"))

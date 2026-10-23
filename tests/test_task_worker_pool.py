@@ -136,7 +136,10 @@ def test_pool_executes_different_workspaces_in_parallel(
         f"{pool.worker_id}-1",
     ]
     try:
-        with patch("kuzya.task_worker.subprocess.run", side_effect=fake_run):
+        with patch(
+            "kuzya.task_worker.TaskProcessRegistry.run_process",
+            side_effect=lambda task_id, cmd, **kwargs: (fake_run(cmd, **kwargs), False),
+        ):
             pool.start()
             _wait_for(lambda: len(outcomes) == 2)
     finally:
@@ -200,7 +203,10 @@ def test_pool_executes_same_workspace_tasks_sequentially(
         on_task_finished=on_finished,
     )
     try:
-        with patch("kuzya.task_worker.subprocess.run", side_effect=fake_run):
+        with patch(
+            "kuzya.task_worker.TaskProcessRegistry.run_process",
+            side_effect=lambda task_id, cmd, **kwargs: (fake_run(cmd, **kwargs), False),
+        ):
             pool.start()
             _wait_for(lambda: len(outcomes) == 2)
     finally:
@@ -257,7 +263,10 @@ def test_pool_executes_null_workspace_tasks_sequentially(
         on_task_finished=on_finished,
     )
     try:
-        with patch("kuzya.task_worker.subprocess.run", side_effect=fake_run):
+        with patch(
+            "kuzya.task_worker.TaskProcessRegistry.run_process",
+            side_effect=lambda task_id, cmd, **kwargs: (fake_run(cmd, **kwargs), False),
+        ):
             pool.start()
             _wait_for(lambda: len(outcomes) == 2)
     finally:
@@ -401,7 +410,10 @@ def test_pool_stop_waits_for_active_execution(
     )
     stopper = threading.Thread(target=lambda: pool.stop(timeout=5.0), daemon=True)
     try:
-        with patch("kuzya.task_worker.subprocess.run", side_effect=fake_run):
+        with patch(
+            "kuzya.task_worker.TaskProcessRegistry.run_process",
+            side_effect=lambda task_id, cmd, **kwargs: (fake_run(cmd, **kwargs), False),
+        ):
             pool.start()
             assert started.wait(timeout=5.0)
             stopper.start()
@@ -449,7 +461,10 @@ def test_pool_stop_respects_timeout(
         on_task_finished=lambda _task, _outcome: None,
     )
     try:
-        with patch("kuzya.task_worker.subprocess.run", side_effect=fake_run):
+        with patch(
+            "kuzya.task_worker.TaskProcessRegistry.run_process",
+            side_effect=lambda task_id, cmd, **kwargs: (fake_run(cmd, **kwargs), False),
+        ):
             pool.start()
             assert started.wait(timeout=5.0)
             began = time.monotonic()

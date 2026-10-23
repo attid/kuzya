@@ -139,6 +139,10 @@ class BackendClient:
     async def get_task(self, task_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/tasks/{task_id}")
 
+    async def interrupt_task(self, task_id: str) -> dict[str, Any]:
+        """Request a manual stop of a running task execution."""
+        return await self._request("POST", f"/tasks/{task_id}/interrupt")
+
     async def get_task_counts(self) -> dict[str, int]:
         """Return task counts keyed by status."""
         return await self._request("GET", "/tasks/counts")

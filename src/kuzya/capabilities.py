@@ -704,6 +704,17 @@ _ENDPOINT_CAPABILITIES: tuple[Capability, ...] = (
         summary="read task execution session transcript",
     ),
     _endpoint(
+        "POST",
+        "/tasks/{task_id}/interrupt",
+        action="tasks.write",
+        doc="task-lifecycle.md",
+        summary=(
+            "request a manual stop of a running execution: signals the "
+            "runner process group and lands the task in waiting_for_input "
+            "with a stopped-manually clarification"
+        ),
+    ),
+    _endpoint(
         "PATCH",
         "/tasks/{task_id}",
         action="tasks.write",

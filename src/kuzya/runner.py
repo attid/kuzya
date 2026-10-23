@@ -42,6 +42,7 @@ from kuzya.storage import Database, TaskRepository
 from kuzya.task_worker import (
     MAX_TASK_CONCURRENCY,
     TaskExecutionWorkerPool,
+    TaskProcessRegistry,
 )
 from kuzya.task_subscriptions import TaskSubscriptions
 from kuzya.telegram.bot import create_bot, setup_bot_commands
@@ -431,6 +432,10 @@ class KuzyaServices:
         task_artifacts = self.config.artifact_root / "tasks"
         task_artifacts.mkdir(parents=True, exist_ok=True)
 
+        # One live process registry shared by the task pool (which registers
+        # each runner) and the API (whose interrupt endpoint signals them).
+        self.task_process_registry = TaskProcessRegistry()
+
         self.task_subscriptions = TaskSubscriptions(
             self.database, knowledge_base=self.knowledge_base,
             default_chat_id=(self.config.telegram_config.allowed_user_id if self.config.telegram_config else None),
@@ -455,6 +460,7 @@ class KuzyaServices:
             poll_interval_seconds=1.0,
             instance=self.instance,
             permissions=self.permissions,
+            process_registry=self.task_process_registry,
         )
 
         # 6. Durable Operation Worker (deferred triggers: review, analysis, Git)
@@ -487,6 +493,7 @@ class KuzyaServices:
             knowledge_base=self.knowledge_base,
             permissions=self.permissions,
             artifact_root=self.config.artifact_root,
+            task_process_registry=self.task_process_registry,
         )
         uvicorn_cfg = uvicorn.Config(
             app=app,

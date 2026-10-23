@@ -264,7 +264,13 @@ def test_task_worker_parses_pretty_printed_runner_result(
     mock_run = MagicMock(
         return_value=MagicMock(returncode=0, stdout=runner_stdout, stderr="")
     )
-    with patch("subprocess.run", mock_run):
+    with patch("subprocess.run", mock_run), patch(
+        "kuzya.task_worker.TaskProcessRegistry.run_process",
+        side_effect=lambda task_id, cmd, **kwargs: (
+            mock_run(cmd, **kwargs),
+            False,
+        ),
+    ):
         outcome = worker.step()
 
     assert outcome is not None
@@ -560,7 +566,13 @@ def test_task_worker_skills_and_devops_git_commit(migrated_db: Path, tmp_path: P
     )
 
     mock_run = MagicMock(return_value=MagicMock(returncode=0, stdout='{"status": "completed", "changed_files": []}', stderr=""))
-    with patch("subprocess.run", mock_run):
+    with patch("subprocess.run", mock_run), patch(
+        "kuzya.task_worker.TaskProcessRegistry.run_process",
+        side_effect=lambda task_id, cmd, **kwargs: (
+            mock_run(cmd, **kwargs),
+            False,
+        ),
+    ):
         outcome = worker.step()
 
     assert outcome is not None
@@ -603,7 +615,13 @@ def test_task_worker_code_review_cycle_invoked(migrated_db: Path, tmp_path: Path
     (tmp_path / "dev_sum.md").write_text("Fixed pagination.")
 
     mock_run = MagicMock(return_value=MagicMock(returncode=0, stdout=dev_output, stderr=""))
-    with patch("subprocess.run", mock_run):
+    with patch("subprocess.run", mock_run), patch(
+        "kuzya.task_worker.TaskProcessRegistry.run_process",
+        side_effect=lambda task_id, cmd, **kwargs: (
+            mock_run(cmd, **kwargs),
+            False,
+        ),
+    ):
             with patch.object(worker, "_run_review_cycle") as mock_review:
                 mock_review.return_value = {
                     "summary": "Fixed pagination.\n\n### 🔍 Code Review: ОДОБРЕНО ✅",

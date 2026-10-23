@@ -25,6 +25,7 @@ tools bound what its sandbox can reach even through raw HTTP.
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import logging
 import os
 import time
@@ -794,6 +795,7 @@ def create_app(
     knowledge_base: KnowledgeBase | None = None,
     permissions: ExecutionPermissions | None = None,
     artifact_root: str | Path | None = None,
+    task_process_registry: Any | None = None,
 ) -> FastAPI:
     """Build a FastAPI application bound to a file-backed SQLite database.
 
@@ -829,6 +831,7 @@ def create_app(
     require_auth = bool(resolved_tokens) or permissions_provided
 
     app = FastAPI(title="Kuzya", version="0.1.0", lifespan=_lifespan)
+    app.state.task_process_registry = task_process_registry
     app.state.database_url = url
     app.state.api_tokens = resolved_tokens
     app.state.permissions = resolved_permissions
@@ -1466,6 +1469,50 @@ def create_app(
                 detail=f"task not found: {error.task_id}",
             ) from error
         return task_to_read(task)
+
+    @app.post(
+        "/tasks/{task_id}/interrupt",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def interrupt_task(
+        task_id: str,
+        repository: TaskRepository = Depends(get_repository),
+    ) -> dict[str, object]:
+        """Request a manual stop of a running task execution.
+
+        Marks the task ``stop_requested`` and signals the live runner process
+        group (SIGTERM, escalating to SIGKILL). The worker then records the
+        task as ``waiting_for_input`` with an explicit "stopped manually"
+        clarification, so the owner replies with new instructions and the
+        session resumes. signalling the group reaches every node and bwrap
+        child the runner spawned.
+        """
+        task = repository.get(task_id)
+        if task is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"task not found: {task_id}",
+            )
+        meta = dict(task.meta or {})
+        if meta.get("execution_status") != "running":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "task is not running "
+                    f"(execution_status={meta.get('execution_status')!r})"
+                ),
+            )
+        registry = getattr(app.state, "task_process_registry", None)
+        signalled = bool(registry is not None and registry.request_interrupt(task_id))
+        meta["execution_stop_requested_at"] = dt.datetime.now(
+            dt.timezone.utc
+        ).isoformat()
+        repository.update(task_id, metadata=meta)
+        return {
+            "task_id": task_id,
+            "status": "stop_requested",
+            "process_signalled": signalled,
+        }
 
     @app.post(
         "/conversations",

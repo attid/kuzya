@@ -206,9 +206,20 @@ def dialog_switch_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=[[button]])
 
 
-def task_card_keyboard(task_id: str, status: str) -> InlineKeyboardMarkup:
+def task_card_keyboard(
+    task_id: str, status: str, *, running: bool = False
+) -> InlineKeyboardMarkup:
     """Actions available for a selected task card."""
     buttons: list[list[InlineKeyboardButton]] = []
+
+    if running:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text="⏹ Остановить", callback_data=f"interrupt_task:{task_id}"
+                )
+            ]
+        )
 
     action_row: list[InlineKeyboardButton] = []
     if status != "incoming":

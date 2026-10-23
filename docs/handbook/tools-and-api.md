@@ -39,6 +39,7 @@ greedy path parameters (`:path`).
 | `GET` | `/monitor/executions` | `200` | `tasks.read` | Running tasks/operations, bounded live session stats and queue counts; `verbose=true` adds operation input and changed-file names. |
 | `GET` | `/tasks/{task_id}` | `200`, `404` | `tasks.read` | Read one task. |
 | `PATCH` | `/tasks/{task_id}` | `200`, `404`, `409`, `422` | `tasks.write` | Partial update; `409` while the task is running. |
+| `POST` | `/tasks/{task_id}/interrupt` | `202`, `404`, `409` | `tasks.write` | Request a manual stop of a running execution; the task lands in `waiting_for_input` with a stopped-manually clarification. |
 | `GET` | `/tasks/{task_id}/artifacts` | `200`, `404` | `tasks.read` | List artifact metadata. |
 | `GET` | `/tasks/{task_id}/artifacts/{artifact_name}` | `200`, `404` | `tasks.read` | Download one artifact (raw bytes, `text/plain`). |
 | `GET` | `/tasks/{task_id}/session` | `200`, `404` | `tasks.read` | Session id, summary, paths, changed files, usage. |
@@ -329,6 +330,24 @@ Read-only preflight; never writes.
 - `404` unknown task. A task without review artifacts returns `[]`. This is
   a read-only projection: it does not start a review, parse the database
   verdict or read a path named inside an artifact.
+
+#### `POST /tasks/{task_id}/interrupt`
+
+- Auth: `tasks.write` on `task:<id>`; a scoped token may stop only its own
+  task.
+- No body. `202` `{task_id, status: "stop_requested", process_signalled}`.
+  The runner process group receives SIGTERM (escalating to SIGKILL after a
+  grace window), and the worker records the task `waiting_for_input` with a
+  "stopped manually" clarification. The session journal is append-only, so
+  the next run resumes the session; replying to the clarification delivers
+  new instructions to the same agent.
+- Errors: `404` unknown task, `409` when the task is not running
+  (`execution_status != "running"`). `process_signalled: false` means the
+  stop marker was stored but no live process handle existed (for example the
+  request raced the run's end); the recorded execution outcome governs what
+  happens next.
+- Workspace changes made before the stop are **not** rolled back; use the
+  existing rollback operation afterwards if needed.
 
 #### `POST /tasks/{task_id}/attachments`
 

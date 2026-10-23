@@ -170,3 +170,16 @@ def test_other_exclusion_covers_the_same_categories_as_the_regular_tabs() -> Non
         "done",
         "archived",
     }
+
+
+def test_task_card_keyboard_shows_stop_only_while_running() -> None:
+    from kuzya.telegram.keyboards import task_card_keyboard
+
+    running = task_card_keyboard("t1", "in_progress", running=True)
+    flat_running = [b.text for row in running.inline_keyboard for b in row]
+    assert "⏹ Остановить" in flat_running
+    assert flat_running[0] == "⏹ Остановить"
+
+    idle = task_card_keyboard("t1", "in_progress", running=False)
+    flat_idle = [b.text for row in idle.inline_keyboard for b in row]
+    assert "⏹ Остановить" not in flat_idle
