@@ -35,6 +35,7 @@ from .operation_worker import (
     OperationContext,
     OperationExecutionError,
     OperationWorker,
+    OperationWorkerPool,
 )
 from .review_executor import (
     REVIEWER_AGENT_ID,
@@ -264,10 +265,13 @@ def review_operation_handler(context: OperationContext) -> dict[str, Any]:
     return result.to_dict()
 
 
-def register_default_operation_handlers(worker: OperationWorker) -> None:
+def register_default_operation_handlers(
+    worker: OperationWorker | OperationWorkerPool,
+) -> None:
     """Register the built-in Git, review and analysis executors on ``worker``.
 
-    Called from the runner composition root. A kind with no registered
+    Called from the runner composition root with either a lone worker or a
+    worker pool; both expose ``register``. A kind with no registered
     executor still fails visibly with an unknown-executor diagnostic.
     """
     worker.register(OPERATION_KIND_GIT_COMMIT_PUSH, git_commit_push_handler)

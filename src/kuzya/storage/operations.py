@@ -38,16 +38,29 @@ from __future__ import annotations
 
 import dataclasses
 import sqlite3
+import threading
 import uuid
 from collections.abc import Mapping
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session
 
 from .database import Database
-from .models import Operation, utcnow
+from .models import Operation, Task, utcnow
+
+#: Kinds whose executors only read shared state. Analyzers run read-only in
+#: their own sandbox and any number of them may execute concurrently, even
+#: though they share one analyzer workspace. Every other kind (Git, review)
+#: mutates one task workspace and serializes on it.
+OPERATION_READ_ONLY_KINDS = frozenset({"analysis"})
+
+#: Serializes claim transactions across every repository instance: pool
+#: workers each build their own repository, so the lock must be shared to
+#: keep ``BEGIN IMMEDIATE`` contention rare instead of constant.
+_CLAIM_LOCK = threading.Lock()
 
 #: Queued, not yet claimed.
 OPERATION_STATUS_ACCEPTED = "accepted"
@@ -309,47 +322,98 @@ class OperationRepository:
     # -- claim -----------------------------------------------------------
 
     def claim_next(self, *, worker_id: str | None = None) -> Operation | None:
-        """Atomically claim the oldest queued operation.
+        """Atomically claim the oldest claimable queued operation.
+
+        Workspace-mutating kinds (Git, review) serialize on their target
+        task's workspace: while one such operation is ``running``, the next
+        operation on the same workspace is skipped and a claimable one from
+        a different workspace (or a read-only analysis) is taken instead —
+        a busy folder never blocks the rest of the queue. Read-only kinds
+        never serialize. The claim opens an immediate write transaction, so
+        concurrent pool workers observe each other's committed claims and
+        two workers can never hold the same workspace.
 
         Returns the claimed operation carrying a fresh ``claim_token``, or
-        ``None`` when nothing is queued. The conditional ``UPDATE ... WHERE
-        status IN queued`` makes concurrent workers safe: the loser observes
-        the committed status and retries on a fresh snapshot.
+        ``None`` when nothing was claimable.
         """
         return _run_with_retry(lambda: self._claim_once(worker_id=worker_id))
 
+    def _serialization_key(
+        self, session: Session, operation: Operation
+    ) -> str | None:
+        """The workspace an operation serializes on; ``None`` means free.
+
+        Read-only kinds never serialize. Mutating kinds resolve their target
+        task's workspace; tasks without a workspace form one default group,
+        mirroring :meth:`TaskRepository.claim_in_progress`. An operation
+        with no resolvable target neither blocks nor is blocked.
+        """
+        if operation.kind in OPERATION_READ_ONLY_KINDS:
+            return None
+        if operation.target_id is None:
+            return ""
+        task = session.get(Task, operation.target_id)
+        if task is None:
+            return None
+        return task.workspace or ""
+
     def _claim_once(self, *, worker_id: str | None) -> Operation | None:
         for _ in range(_MAX_OPERATION_ATTEMPTS):
-            with self._database.session() as session:
-                candidate = session.scalars(
-                    select(Operation)
-                    .where(Operation.status.in_(OPERATION_QUEUED_STATUSES))
-                    .order_by(Operation.sequence)
-                    .limit(1)
-                ).first()
-                if candidate is None:
-                    return None
-
-                claim_token = uuid.uuid4().hex
-                result = session.execute(
-                    update(Operation)
-                    .where(
-                        Operation.id == candidate.id,
-                        Operation.status.in_(OPERATION_QUEUED_STATUSES),
+            with _CLAIM_LOCK:
+                with self._database.session() as session:
+                    # Acquire the write lock before reading, exactly like
+                    # the task claim: a deferred transaction could keep a
+                    # stale snapshot and let two workers claim one workspace.
+                    session.execute(text("BEGIN IMMEDIATE"))
+                    candidates = list(
+                        session.scalars(
+                            select(Operation)
+                            .where(
+                                Operation.status.in_(OPERATION_QUEUED_STATUSES)
+                            )
+                            .order_by(Operation.sequence)
+                        )
                     )
-                    .values(
-                        status=OPERATION_STATUS_RUNNING,
-                        claim_token=claim_token,
-                        worker_id=worker_id,
-                        claimed_at=utcnow(),
-                        updated_at=utcnow(),
-                        attempt_count=Operation.attempt_count + 1,
-                    )
-                    .execution_options(synchronize_session=False)
-                )
-                if result.rowcount == 1:
-                    session.refresh(candidate)
-                    return candidate
+                    if not candidates:
+                        return None
+                    busy_keys = {
+                        key
+                        for running in session.scalars(
+                            select(Operation).where(
+                                Operation.status == OPERATION_STATUS_RUNNING
+                            )
+                        )
+                        if (
+                            key := self._serialization_key(session, running)
+                        )
+                        is not None
+                    }
+                    for candidate in candidates:
+                        key = self._serialization_key(session, candidate)
+                        if key is not None and key in busy_keys:
+                            continue
+                        claim_token = uuid.uuid4().hex
+                        result = session.execute(
+                            update(Operation)
+                            .where(
+                                Operation.id == candidate.id,
+                                Operation.status.in_(
+                                    OPERATION_QUEUED_STATUSES
+                                ),
+                            )
+                            .values(
+                                status=OPERATION_STATUS_RUNNING,
+                                claim_token=claim_token,
+                                worker_id=worker_id,
+                                claimed_at=utcnow(),
+                                updated_at=utcnow(),
+                                attempt_count=Operation.attempt_count + 1,
+                            )
+                            .execution_options(synchronize_session=False)
+                        )
+                        if result.rowcount == 1:
+                            session.refresh(candidate)
+                            return candidate
             # Lost a race against another worker; retry on a fresh snapshot.
         return None
 

@@ -421,3 +421,205 @@ def test_api_reports_failed_operation_and_not_success(
 
 def _raise_analysis_error(context: object) -> dict[str, object]:
     raise RuntimeError("analysis failed")
+
+
+# -- workspace serialization and the worker pool -------------------------
+
+
+def _task(database: Database, workspace: str | None) -> str:
+    from kuzya.storage import TaskRepository
+
+    return TaskRepository(database).create(
+        title="t", workspace=workspace
+    ).id
+
+
+def test_claim_serializes_mutating_operations_per_workspace(
+    migrated_db: pathlib.Path,
+) -> None:
+    database, repository = _repository(migrated_db)
+    try:
+        first = repository.submit(
+            kind=OPERATION_KIND_GIT_COMMIT_PUSH,
+            target_id=_task(database, "/ws/shared"),
+        )
+        second = repository.submit(
+            kind=OPERATION_KIND_GIT_COMMIT_PUSH,
+            target_id=_task(database, "/ws/shared"),
+        )
+
+        claimed = repository.claim_next(worker_id="w1")
+        assert claimed is not None and claimed.id == first.operation.id
+
+        # Same workspace is busy: nothing else is claimable.
+        assert repository.claim_next(worker_id="w2") is None
+
+        repository.complete(claimed.id, claimed.claim_token or "")
+        after = repository.claim_next(worker_id="w2")
+        assert after is not None and after.id == second.operation.id
+    finally:
+        database.dispose()
+
+
+def test_claim_keeps_read_only_analyses_parallel(
+    migrated_db: pathlib.Path,
+) -> None:
+    database, repository = _repository(migrated_db)
+    try:
+        task_id = _task(database, "/ws/analyzer-target")
+        repository.submit(kind="analysis", target_id=task_id)
+        repository.submit(kind="analysis", target_id=task_id)
+
+        first = repository.claim_next(worker_id="w1")
+        second = repository.claim_next(worker_id="w2")
+        assert first is not None and second is not None
+        assert first.id != second.id
+    finally:
+        database.dispose()
+
+
+def test_claim_skips_a_busy_workspace_without_blocking_the_queue(
+    migrated_db: pathlib.Path,
+) -> None:
+    database, repository = _repository(migrated_db)
+    try:
+        running = repository.submit(
+            kind=OPERATION_KIND_GIT_COMMIT_PUSH,
+            target_id=_task(database, "/ws/a"),
+        )
+        blocked = repository.submit(
+            kind=OPERATION_KIND_GIT_COMMIT_PUSH,
+            target_id=_task(database, "/ws/a"),
+        )
+        free = repository.submit(
+            kind=OPERATION_KIND_GIT_COMMIT_PUSH,
+            target_id=_task(database, "/ws/b"),
+        )
+
+        claimed = repository.claim_next(worker_id="w1")
+        assert claimed is not None and claimed.id == running.operation.id
+
+        # The blocked operation is older, but the free workspace wins.
+        skipped_to = repository.claim_next(worker_id="w2")
+        assert skipped_to is not None and skipped_to.id == free.operation.id
+        assert blocked.operation.id not in {
+            claimed.id,
+            skipped_to.id,
+        }
+    finally:
+        database.dispose()
+
+
+def test_pool_runs_two_analyses_concurrently(
+    migrated_db: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    import threading
+
+    from kuzya.operation_worker import OperationWorkerPool
+
+    database = Database.from_path(migrated_db)
+    try:
+        pool = OperationWorkerPool(
+            database, concurrency=2, artifact_root=tmp_path / "operations"
+        )
+        barrier = threading.Barrier(2, timeout=10)
+
+        def handler(context: object) -> dict[str, object]:
+            # Only passes when both pool workers execute at once; a
+            # serialized claim would leave one side waiting forever.
+            barrier.wait()
+            return {"ok": True}
+
+        pool.register("analysis", handler)
+        task_id = _task(database, "/ws/analyzer-target")
+        repository = OperationRepository(database)
+        submitted = [
+            repository.submit(kind="analysis", target_id=task_id)
+            for _ in range(2)
+        ]
+
+        outcomes: list[str] = []
+
+        def run_step(worker: object) -> None:
+            outcome = worker.step()
+            outcomes.append("none" if outcome is None else outcome.status)
+
+        threads = [
+            threading.Thread(target=run_step, args=(worker,))
+            for worker in pool.workers
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15)
+
+        assert sorted(outcomes) == ["succeeded", "succeeded"]
+        statuses = {
+            repository.get(submitted[i].operation.id).status for i in range(2)
+        }
+        assert statuses == {"succeeded"}
+    finally:
+        database.dispose()
+
+
+def test_pool_reconciles_orphans_once_and_not_per_worker(
+    migrated_db: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    from kuzya.operation_worker import OperationWorkerPool
+
+    database = Database.from_path(migrated_db)
+    try:
+        repository = OperationRepository(database)
+        submitted = repository.submit(
+            kind=OPERATION_KIND_GIT_COMMIT_PUSH,
+            target_id=_task(database, "/ws/a"),
+        )
+        orphan = repository.claim_next(worker_id="dead-process")
+        assert orphan is not None
+
+        pool = OperationWorkerPool(
+            database, concurrency=2, artifact_root=tmp_path / "operations"
+        )
+        pool.start()
+        try:
+            # The pool start reconciled the orphan exactly once...
+            assert (
+                repository.get(submitted.operation.id).status
+                == "interrupted"
+            )
+            # ...and a sibling worker starting later must not re-run the
+            # reconciliation: a freshly claimed operation would be marked
+            # interrupted by its own pool.
+            fresh = repository.submit(
+                kind="analysis", target_id=_task(database, "/ws/any")
+            )
+            claimed = repository.claim_next(worker_id="pool-worker")
+            assert claimed is not None
+            pool.workers[1].start()
+            assert (
+                repository.get(claimed.id).status == "running"
+            )
+            assert fresh.created is True
+        finally:
+            pool.stop(timeout=5.0)
+        assert not pool.is_running
+    finally:
+        database.dispose()
+
+
+def test_pool_rejects_out_of_range_concurrency(
+    migrated_db: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    from kuzya.operation_worker import MAX_OPERATION_CONCURRENCY, OperationWorkerPool
+
+    database = Database.from_path(migrated_db)
+    try:
+        for bad in (0, -1, MAX_OPERATION_CONCURRENCY + 1, True):
+            with pytest.raises(ValueError):
+                OperationWorkerPool(
+                    database,
+                    concurrency=bad,
+                    artifact_root=tmp_path / "operations",
+                )
+    finally:
+        database.dispose()

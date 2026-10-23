@@ -30,8 +30,10 @@ from kuzya.operation_handlers import (
     register_default_operation_handlers,
 )
 from kuzya.operation_worker import (
+    DEFAULT_OPERATION_CONCURRENCY,
+    MAX_OPERATION_CONCURRENCY,
     OperationInstanceContext,
-    OperationWorker,
+    OperationWorkerPool,
 )
 from kuzya.permissions import ExecutionPermissions
 from kuzya.persistent_conversation import PersistentConversationHandler
@@ -70,6 +72,7 @@ class RunnerConfig:
     secretary_agent_id: str = "system-secretary"
     developer_agent_id: str = "kuzya-developer"
     task_concurrency: int = 3
+    operation_concurrency: int = DEFAULT_OPERATION_CONCURRENCY
     auto_migrate: bool = True
     telegram_config: TelegramConfig | None = None
     api_tokens: tuple[str, ...] = ()
@@ -188,6 +191,27 @@ class RunnerConfig:
                 f"1 and {MAX_TASK_CONCURRENCY}"
             )
 
+        try:
+            operation_concurrency = int(
+                os.environ.get(
+                    "KUZYA_OPERATION_CONCURRENCY",
+                    str(DEFAULT_OPERATION_CONCURRENCY),
+                )
+            )
+        except ValueError as error:
+            raise ValueError(
+                "KUZYA_OPERATION_CONCURRENCY must be an integer between "
+                f"1 and {MAX_OPERATION_CONCURRENCY}"
+            ) from error
+        if (
+            operation_concurrency < 1
+            or operation_concurrency > MAX_OPERATION_CONCURRENCY
+        ):
+            raise ValueError(
+                "KUZYA_OPERATION_CONCURRENCY must be an integer between "
+                f"1 and {MAX_OPERATION_CONCURRENCY}"
+            )
+
         api_tokens_raw = os.environ.get("KUZYA_API_TOKENS")
         if not api_tokens_raw:
             api_tokens_raw = os.environ.get("KUZYA_API_TOKEN", "")
@@ -226,6 +250,7 @@ class RunnerConfig:
                 "KUZYA_DEVELOPER_AGENT_ID", "kuzya-developer"
             ),
             task_concurrency=task_concurrency,
+            operation_concurrency=operation_concurrency,
             auto_migrate=auto_migrate,
             telegram_config=telegram_cfg,
             api_tokens=api_tokens,
@@ -262,7 +287,7 @@ class KuzyaServices:
         self.database: Database | None = None
         self.queue_dispatcher: QueueDispatcher | None = None
         self.task_worker: TaskExecutionWorkerPool | None = None
-        self.operation_worker: OperationWorker | None = None
+        self.operation_worker: OperationWorkerPool | None = None
         self.task_subscriptions: TaskSubscriptions | None = None
         self.bot = None
         self.dp = None
@@ -445,8 +470,9 @@ class KuzyaServices:
             permissions=self.permissions,
             runtime_defaults=RuntimeDefaultsResolver(),
         )
-        self.operation_worker = OperationWorker(
+        self.operation_worker = OperationWorkerPool(
             self.database,
+            concurrency=self.config.operation_concurrency,
             instance=operation_instance,
             poll_interval_seconds=1.0,
         )
@@ -482,7 +508,7 @@ class KuzyaServices:
             self.task_worker.start()
 
         if self.operation_worker:
-            logger.info("Starting OperationWorker background thread...")
+            logger.info("Starting OperationWorkerPool background threads...")
             self.operation_worker.start()
 
     def stop_background_threads(self) -> None:
@@ -493,11 +519,13 @@ class KuzyaServices:
         five-second shutdown window.
         """
         if self.operation_worker:
-            logger.info("Stopping OperationWorker...")
+            logger.info("Stopping OperationWorkerPool...")
             try:
-                self.operation_worker.stop(timeout=5.0)
+                self.operation_worker.stop(
+                    timeout=5.0 * max(1, self.config.operation_concurrency)
+                )
             except Exception as e:
-                logger.warning("Error stopping OperationWorker: %s", e)
+                logger.warning("Error stopping OperationWorkerPool: %s", e)
 
         if self.task_worker:
             logger.info("Stopping TaskExecutionWorkerPool...")

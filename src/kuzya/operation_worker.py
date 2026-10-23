@@ -150,6 +150,11 @@ def _format_error(error: BaseException) -> str:
     return f"{type(error).__name__}: {error}"
 
 
+#: Default and maximum size of the :class:`OperationWorkerPool`.
+DEFAULT_OPERATION_CONCURRENCY = 5
+MAX_OPERATION_CONCURRENCY = 16
+
+
 class OperationWorker:
     """Claim and execute durable operations with registered executors.
 
@@ -162,6 +167,10 @@ class OperationWorker:
             context when ``instance`` is omitted.
         poll_interval_seconds: Idle wait between polls. Non-negative.
         worker_id: Optional stable identifier used in records and logs.
+        reconcile_on_start: Run orphan reconciliation in :meth:`start`. A
+            pool must pass ``False`` and reconcile once for the whole pool
+            instead: a per-worker pass would mark operations claimed by
+            sibling workers as interrupted.
     """
 
     def __init__(
@@ -172,6 +181,7 @@ class OperationWorker:
         artifact_root: str | Path | None = None,
         poll_interval_seconds: float = 0.5,
         worker_id: str | None = None,
+        reconcile_on_start: bool = True,
     ) -> None:
         if poll_interval_seconds < 0:
             raise ValueError("poll_interval_seconds must be non-negative")
@@ -192,6 +202,7 @@ class OperationWorker:
             )
         self._poll_interval_seconds = float(poll_interval_seconds)
         self.worker_id = worker_id or f"operation-worker-{uuid.uuid4().hex[:8]}"
+        self._reconcile_on_start = reconcile_on_start
 
         self._lifecycle_lock = threading.Lock()
         self._thread: threading.Thread | None = None
@@ -226,6 +237,16 @@ class OperationWorker:
     def instance(self) -> OperationInstanceContext:
         """The trusted per-instance context handed to executors."""
         return self._instance
+
+    @property
+    def thread(self) -> threading.Thread | None:
+        """The background loop thread, once started."""
+        return self._thread
+
+    @property
+    def is_running(self) -> bool:
+        """Whether this worker's background loop thread is alive."""
+        return self._thread is not None and self._thread.is_alive()
 
     # -- reconciliation --------------------------------------------------
 
@@ -392,7 +413,8 @@ class OperationWorker:
                 return
             self._stop_event = threading.Event()
             self._reconciled = False
-            self.reconcile_startup_orphans()
+            if self._reconcile_on_start:
+                self.reconcile_startup_orphans()
             self._thread = threading.Thread(
                 target=self.run_loop,
                 args=(self._stop_event,),
@@ -444,8 +466,105 @@ class OperationWorker:
         )
 
 
+class OperationWorkerPool:
+    """Run several :class:`OperationWorker` loops concurrently.
+
+    Analyzers are read-only and any number may execute at once; Git and
+    review executors mutate one task workspace, and the repository claim
+    keeps same-workspace operations strictly sequential — the same rule
+    task execution already follows. Extra threads therefore parallelize
+    only independent work (three backlog analyses run side by side, a hung
+    one no longer freezes the queue).
+
+    Orphan reconciliation runs once for the whole pool before any worker
+    thread starts: a per-worker pass could mark operations claimed by
+    sibling workers as interrupted.
+    """
+
+    def __init__(
+        self,
+        database: Database,
+        *,
+        concurrency: int = DEFAULT_OPERATION_CONCURRENCY,
+        worker_id: str | None = None,
+        **worker_kwargs: Any,
+    ) -> None:
+        if isinstance(concurrency, bool) or not isinstance(concurrency, int):
+            raise ValueError("concurrency must be an integer")
+        if concurrency < 1 or concurrency > MAX_OPERATION_CONCURRENCY:
+            raise ValueError(
+                f"concurrency must be between 1 and {MAX_OPERATION_CONCURRENCY}"
+            )
+        self.concurrency = concurrency
+        prefix = worker_id or f"operation-worker-{uuid.uuid4().hex[:8]}"
+        self._workers = tuple(
+            OperationWorker(
+                database,
+                worker_id=f"{prefix}-{index}",
+                reconcile_on_start=False,
+                **worker_kwargs,
+            )
+            for index in range(concurrency)
+        )
+        self._lifecycle_lock = threading.Lock()
+
+    @property
+    def workers(self) -> tuple[OperationWorker, ...]:
+        """Workers owned by the pool, in index order."""
+        return self._workers
+
+    @property
+    def threads(self) -> tuple[threading.Thread, ...]:
+        """Started worker threads, in index order."""
+        return tuple(
+            worker.thread for worker in self._workers if worker.thread is not None
+        )
+
+    @property
+    def is_running(self) -> bool:
+        """Whether every worker loop thread is alive."""
+        return all(worker.is_running for worker in self._workers)
+
+    # -- registration ----------------------------------------------------
+
+    def register(self, kind: str, handler: OperationHandler) -> None:
+        """Register one executor on every worker of the pool."""
+        for worker in self._workers:
+            worker.register(kind, handler)
+
+    def registered_kinds(self) -> tuple[str, ...]:
+        """Return the registered executor kinds in sorted order."""
+        return self._workers[0].registered_kinds()
+
+    def reconcile_startup_orphans(
+        self, *, reason: str = DEFAULT_ORPHAN_REASON
+    ) -> list[str]:
+        """Run orphan reconciliation once for the whole pool."""
+        return self._workers[0].reconcile_startup_orphans(reason=reason)
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def start(self) -> None:
+        """Reconcile orphans once, then start every worker loop."""
+        with self._lifecycle_lock:
+            if self.is_running:
+                return
+            self.reconcile_startup_orphans()
+            for worker in self._workers:
+                worker.start()
+
+    def stop(self, timeout: float | None = None) -> None:
+        """Request a graceful stop of every worker after its active operation."""
+        with self._lifecycle_lock:
+            for worker in self._workers:
+                worker.stop(timeout)
+
+
 __all__ = [
+    "DEFAULT_OPERATION_CONCURRENCY",
     "DEFAULT_ORPHAN_REASON",
+    "MAX_OPERATION_CONCURRENCY",
+    "OPERATION_KIND_ANALYSIS",
     "OPERATION_KIND_ANALYSIS",
     "OPERATION_KIND_GIT_COMMIT_PUSH",
     "OPERATION_KIND_GIT_ROLLBACK",
@@ -457,4 +576,5 @@ __all__ = [
     "OperationInstanceContext",
     "OperationOutcome",
     "OperationWorker",
+    "OperationWorkerPool",
 ]
