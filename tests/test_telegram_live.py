@@ -256,7 +256,9 @@ def test_live_command_sends_a_40_worker_monitor_through_rich_path() -> None:
         "rich_message"
     ].markdown
     assert len(markdown) <= RICH_TEXT_LIMIT
-    assert all(f"#{number} ·" in markdown for number in range(1, 41))
+    # The rich transport shrinks every leading ``#N`` into an inline code
+    # span so Telegram cannot render monitor rows as huge headings.
+    assert all(f"`#{number}` ·" in markdown for number in range(1, 41))
     assert all(f"агент agent-{number}" in markdown for number in range(1, 41))
     message.bot.send_message.assert_not_awaited()
 
@@ -325,6 +327,7 @@ def test_callback_redraws_verbose_workers_under_the_rich_limit() -> None:
         "rich_message"
     ].markdown
     assert len(markdown) <= RICH_TEXT_LIMIT
-    assert all(f"#{number} ·" in markdown for number in range(1, 41))
+    # Leading ``#N`` is escaped into an inline code span in the rich edit.
+    assert all(f"`#{number}` ·" in markdown for number in range(1, 41))
     assert all(f"агент agent-{number}" in markdown for number in range(1, 41))
     callback.answer.assert_awaited_with("Обновлено")

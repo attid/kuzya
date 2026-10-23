@@ -28,7 +28,7 @@ from kuzya.telegram.messenger import (
     compose_dialog_message,
     conversation_hashtag,
     format_verified_caller,
-    markdown_footer_safe,
+    markdown_hashtag_safe,
     render_foreign_context_plate,
     send_markdown,
     split_for_telegram,
@@ -648,15 +648,41 @@ def test_retry_reuses_frozen_plan_when_context_plate_changes(
         database.dispose()
 
 
-def test_markdown_footer_safe_wraps_only_the_footer_hashtag() -> None:
+def test_markdown_hashtag_safe_shrinks_every_leading_hash_line() -> None:
     hex32 = "a" * 32
-    text = f"# Ответ агента\n\nТекст с номером #41.\n\n#{hex32}"
-    safe = markdown_footer_safe(text)
-    # The footer hashtag becomes a small inline code span...
-    assert safe == f"# Ответ агента\n\nТекст с номером #41.\n\n`#{hex32}`"
-    # ...while secretary-authored headings and mid-line hashtags stay intact,
-    # and short (non-hex32) ids used in tests are not rewritten.
-    assert markdown_footer_safe("текст\n\n#conv-001") == "текст\n\n#conv-001"
+    text = (
+        f"# Ответ агента\n\n"
+        f"#94 · задача · агент dev\n\n"
+        f"Текст с номером #41.\n\n"
+        f"#{hex32}"
+    )
+    safe = markdown_hashtag_safe(text)
+    # A real heading becomes bold at normal size, a hashtag token (task
+    # number, footer id) becomes a small inline code span...
+    assert safe == (
+        f"**Ответ агента**\n\n"
+        f"`#94` · задача · агент dev\n\n"
+        f"Текст с номером #41.\n\n"
+        f"`#{hex32}`"
+    )
+    # ...and mid-line hashtags keep their original shape.
+    assert "Текст с номером #41." in safe
+
+
+def test_markdown_hashtag_safe_is_idempotent_and_wraps_short_ids() -> None:
+    assert markdown_hashtag_safe("#") == "`#`"
+    assert markdown_hashtag_safe("##") == "`##`"
+    assert markdown_hashtag_safe("текст\n\n#conv-001") == "текст\n\n`#conv-001`"
+    once = markdown_hashtag_safe("#94 · задача\n\n#abc123")
+    assert markdown_hashtag_safe(once) == once
+
+
+def test_markdown_hashtag_safe_leaves_code_fences_verbatim() -> None:
+    text = "```python\n# комментарий\nx = 1\n```\n\n## Заголовок"
+    safe = markdown_hashtag_safe(text)
+    assert "# комментарий" in safe
+    assert "x = 1" in safe
+    assert safe.endswith("**Заголовок**")
 
 
 def test_outbox_delivers_agent_talk_reply_with_agent_buttons(

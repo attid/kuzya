@@ -22,6 +22,7 @@ from .client import BackendClient
 from .config import TelegramConfig
 from .messenger import (
     RICH_TEXT_LIMIT,
+    markdown_hashtag_safe,
     rich_edit_message,
     send_rich_or_plain,
 )
@@ -414,7 +415,8 @@ def format_execution_monitor(payload: dict[str, Any]) -> str:
     model can think without emitting an event for a long time.
 
     The message has a hard character budget: the rich transport capacity
-    (``RICH_TEXT_LIMIT``). The first ``MONITOR_FULL_DETAIL_LIMIT`` entries
+    (``RICH_TEXT_LIMIT``), measured on the hashtag-escaped variant the rich
+    transport actually sends. The first ``MONITOR_FULL_DETAIL_LIMIT`` entries
     carry full session counters, later entries collapse to identity/agent/
     elapsed, long fields are clipped, and rows that still do not fit are
     replaced by an explicit remaining count. The queue footer is always
@@ -461,10 +463,13 @@ def format_execution_monitor(payload: dict[str, Any]) -> str:
                 if remaining > 0
                 else None
             )
-            rendered = _render_monitor(
-                prefix, suffix, [*rows, candidate], candidate_summary
+            # The budget check mirrors the transport: every ``#N`` row gains
+            # two backticks in the rich Markdown escaping, so the *safe*
+            # variant is what must fit RICH_TEXT_LIMIT.
+            delivered = markdown_hashtag_safe(
+                _render_monitor(prefix, suffix, [*rows, candidate], candidate_summary)
             )
-            if len(rendered) <= RICH_TEXT_LIMIT:
+            if len(delivered) <= RICH_TEXT_LIMIT:
                 chosen = candidate
                 summary = candidate_summary
                 break

@@ -64,9 +64,9 @@ def conversation_hashtag(conversation_id: str) -> str:
     return f"#{conversation_id}"
 
 
-#: The footer hashtag as produced by :func:`with_conversation_footer`: a
-#: whole line consisting of ``#`` plus a 32-hex conversation id.
-_FOOTER_HASHTAG_RE = re.compile(r"(?m)^#([0-9a-f]{32})$")
+#: One line that starts with hashes: the hashes themselves, an optional
+#: non-space token right after them (``#94``, ``#<uuid>``) and the rest.
+_LEADING_HASH_RE = re.compile(r"^(#{1,6})(\S*)(.*)$")
 
 
 def with_conversation_footer(text: str, conversation_id: str) -> str:
@@ -74,18 +74,50 @@ def with_conversation_footer(text: str, conversation_id: str) -> str:
     return f"{text.rstrip()}\n\n{conversation_hashtag(conversation_id)}"
 
 
-def markdown_footer_safe(text: str) -> str:
-    """Keep the footer hashtag small when the text is parsed as Markdown.
+def _shrink_hash_line(line: str) -> str:
+    """Rewrite one ``#``-leading line so Telegram renders it small."""
+    if not line.startswith("#"):
+        return line
+    match = _LEADING_HASH_RE.match(line)
+    hashes, token, remainder = match.group(1), match.group(2), match.group(3)
+    if token:
+        # ``#94`` or the ``#<uuid>`` footer: an inline code span is small,
+        # monospaced, keeps the ``#`` visible and copies with one tap.
+        return f"`{hashes}{token}`{remainder}"
+    text = remainder.strip()
+    if not text:
+        # A bare ``#`` / ``##`` line would still open a heading.
+        return f"`{hashes}`"
+    # ``## Тема``: bold at normal size keeps the hierarchy without the
+    # huge heading font.
+    return f"**{text}**"
 
-    A line that starts with ``#`` is a heading in Telegram's rich Markdown, so
-    the footer hashtag would render as a huge bold title. Wrapping exactly the
-    footer (``#`` + 32 hex, whole line) in an inline code span renders it
-    small and monospaced with the ``#`` visible — and one tap copies it for
-    diagnostics. Plain-text transports keep the bare hashtag: there it is
-    already small and natively clickable. Secretary-authored headings are not
-    touched: only the exact footer shape is rewritten.
+
+def markdown_hashtag_safe(text: str) -> str:
+    """Keep every ``#``-leading line small when the text is parsed as Markdown.
+
+    Telegram's rich Markdown turns any line that starts with ``#`` into a
+    large bold heading — no space after the hash required — so monitor rows
+    like ``#94 · задача`` and the conversation-UUID footer blow up into
+    titles. Every such line outside a fenced code block is rewritten: a
+    hashtag token becomes a small inline code span, a real heading becomes
+    bold text at normal size. Fenced code blocks stay verbatim, plain-text
+    transports keep the bare original (``#`` is already small and natively
+    clickable there), and a second pass is idempotent because rewritten
+    lines no longer start with ``#``.
     """
-    return _FOOTER_HASHTAG_RE.sub(r"`#\1`", text)
+    out: list[str] = []
+    in_fence = False
+    for line in text.split("\n"):
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if not in_fence and line.startswith("#"):
+            out.append(_shrink_hash_line(line))
+        else:
+            out.append(line)
+    return "\n".join(out)
 
 
 def format_verified_caller(caller: str | None) -> str | None:
@@ -198,7 +230,7 @@ async def send_markdown(
     try:
         message = await bot.send_rich_message(
             chat_id=chat_id,
-            rich_message=InputRichMessage(markdown=markdown_footer_safe(text)),
+            rich_message=InputRichMessage(markdown=markdown_hashtag_safe(text)),
             reply_parameters=reply_parameters,
             reply_markup=keyboard,
         )
@@ -288,7 +320,7 @@ async def rich_edit_message(
             chat_id=chat_id,
             message_id=message_id,
             text=text,
-            rich_message=InputRichMessage(markdown=text),
+            rich_message=InputRichMessage(markdown=markdown_hashtag_safe(text)),
             reply_markup=reply_markup,
         )
         return True
@@ -314,7 +346,7 @@ async def send_rich_or_plain(
     try:
         await bot.send_rich_message(
             chat_id=chat_id,
-            rich_message=InputRichMessage(markdown=text),
+            rich_message=InputRichMessage(markdown=markdown_hashtag_safe(text)),
             reply_markup=reply_markup,
         )
         return
