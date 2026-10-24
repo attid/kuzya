@@ -716,6 +716,8 @@ def test_commit_operation_blocked_without_approved_review(
             action="commit_and_push",
             message="ok",
             commit_hash="abc123",
+            branch="main",
+            ci_status=None,
         )
         monkeypatch.setattr(
             "kuzya.operation_handlers.GitEngine",
@@ -777,6 +779,8 @@ def test_git_and_review_operations_inherit_execution_workspace(
             action="commit_local",
             message="ok",
             commit_hash="abc",
+            branch="main",
+            ci_status=None,
         )
         monkeypatch.setattr(
             "kuzya.operation_handlers.GitEngine",
@@ -803,6 +807,11 @@ def test_git_and_review_operations_inherit_execution_workspace(
         )
         outcome = git_commit_push_handler(context)
         assert outcome["commit_hash"] == "abc"
+        stored_meta = TaskRepository(database).get(task_id).meta
+        git_outcome = stored_meta.get("git_outcome")
+        assert git_outcome["commit_hash"] == "abc"
+        assert git_outcome["source"] == "operation"
+        assert git_outcome["pushed"] is False
         # The engine ran in the execution directory, not the default.
         engine.commit_local.assert_called_once()
         assert (

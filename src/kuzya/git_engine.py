@@ -82,6 +82,69 @@ class GitEngine:
         proc = self._run_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=ws, check=True)
         return proc.stdout.strip()
 
+    def status_summary(self, workspace: Path | str | None) -> dict:
+        """One read-only snapshot of a workspace repository for the API.
+
+        Returns the branch, ahead/behind counters against its upstream,
+        whether the working tree is clean, the modified and untracked paths
+        and the last commit. Raises ``RuntimeError`` when the directory is
+        not a usable git repository — the caller maps that to an HTTP error.
+        """
+        ws = self._resolve_workspace(workspace)
+        status = self._run_cmd(["git", "status", "--porcelain=v1", "-b"], cwd=ws)
+        if status.returncode != 0 or not status.stdout:
+            raise RuntimeError(
+                f"not a usable git repository: {ws} "
+                f"({(status.stderr or '').strip()})"
+            )
+        branch: str | None = None
+        ahead = behind = 0
+        modified: list[str] = []
+        untracked: list[str] = []
+        for line in status.stdout.splitlines():
+            if line.startswith("## "):
+                header = line[3:]
+                branch = header.split("...", 1)[0].strip()
+                if "ahead " in header:
+                    ahead = int(
+                        header.split("ahead ", 1)[1].split()[0].rstrip(",]")
+                    )
+                if "behind " in header:
+                    behind = int(
+                        header.split("behind ", 1)[1].split()[0].rstrip(",]")
+                    )
+                continue
+            path = line[3:].strip().strip('"')
+            # Renames arrive as "old -> new"; the new path is the real one.
+            path = path.split(" -> ", 1)[-1]
+            if line.startswith("??"):
+                untracked.append(path)
+            else:
+                modified.append(path)
+        last_commit: dict | None = None
+        log = self._run_cmd(
+            ["git", "log", "-1", "--format=%H%x1f%s%x1f%cI"], cwd=ws
+        )
+        if log.returncode == 0 and log.stdout.strip():
+            commit_hash, subject, committed_at = log.stdout.strip().split(
+                "\x1f", 2
+            )
+            last_commit = {
+                "hash": commit_hash,
+                "subject": subject,
+                "committed_at": committed_at,
+            }
+        return {
+            "workspace": str(ws),
+            "branch": branch,
+            "ahead": ahead,
+            "behind": behind,
+            "clean": not modified and not untracked,
+            "modified": modified,
+            "untracked": untracked,
+            "last_commit": last_commit,
+        }
+
     def commit_local(
         self,
         workspace: Path | str | None,

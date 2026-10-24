@@ -1044,6 +1044,22 @@ def _review_gate_keyboard(task_id: str, *, push: bool) -> InlineKeyboardMarkup:
     )
 
 
+def _git_outcome_payload(result: Any, *, source: str, pushed: bool | None = None) -> Dict[str, Any]:
+    """The durable git outcome for task metadata, mirroring the operation handler."""
+    payload: Dict[str, Any] = {
+        "action": result.action,
+        "commit_hash": result.commit_hash,
+        "branch": result.branch,
+        "message": result.message,
+        "at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "source": source,
+    }
+    if pushed is not None:
+        payload["pushed"] = pushed
+        payload["ci_status"] = result.ci_status
+    return payload
+
+
 def _task_workspace(task: Dict[str, Any], config: TelegramConfig) -> str | None:
     """Where a task's Git operations run: explicit workspace first, then the
     directory the execution actually used (execution_context.host_path).
@@ -1134,7 +1150,13 @@ async def _commit_local_impl(
         changed_files=changed_files,
     )
     if res.success:
-        await client.patch_task(task_id, status="done")
+        await client.patch_task(
+            task_id,
+            status="done",
+            metadata={
+                "git_outcome": _git_outcome_payload(res, source="telegram")
+            },
+        )
         await status_msg.edit_text(
             f"✅ <b>Задача #{html.escape(task_display_number(task))} закоммичена!</b>\n\n"
             f"Ветка: <code>{html.escape(res.branch or 'HEAD')}</code>\n"
@@ -1204,7 +1226,15 @@ async def _commit_push_impl(
             outcome = "успешно закоммичена и запушена (CI не настроен)."
         else:
             outcome = "успешно закоммичена и запушена."
-        await client.patch_task(task_id, status="done")
+        await client.patch_task(
+            task_id,
+            status="done",
+            metadata={
+                "git_outcome": _git_outcome_payload(
+                    res, source="telegram", pushed=True
+                )
+            },
+        )
         await status_msg.edit_text(
             f"🎉 <b>Задача #{html.escape(task_display_number(task))} {outcome}</b>\n\n"
             f"Ветка: <code>{html.escape(res.branch or 'HEAD')}</code>\n"
@@ -1298,7 +1328,13 @@ async def on_rollback(
     res = git_engine.rollback(workspace=ws, changed_files=changed_files)
 
     if res.success:
-        await client.patch_task(task_id, status="cancelled")
+        await client.patch_task(
+            task_id,
+            status="cancelled",
+            metadata={
+                "git_outcome": _git_outcome_payload(res, source="telegram")
+            },
+        )
         await callback.message.edit_text(
             f"❌ <b>Изменения по задаче #{html.escape(task_display_number(task))} откатаны.</b>\n\n"
             f"Задача переведена в статус <code>cancelled</code>.\n"

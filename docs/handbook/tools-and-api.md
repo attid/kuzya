@@ -40,6 +40,7 @@ greedy path parameters (`:path`).
 | `GET` | `/tasks/{task_id}` | `200`, `404` | `tasks.read` | Read one task. |
 | `PATCH` | `/tasks/{task_id}` | `200`, `404`, `409`, `422` | `tasks.write` | Partial update; `409` while the task is running. |
 | `POST` | `/tasks/{task_id}/interrupt` | `202`, `404`, `409` | `tasks.write` | Request a manual stop of a running execution; the task lands in `waiting_for_input` with a stopped-manually clarification. |
+| `GET` | `/tasks/{task_id}/git/status` | `200`, `404`, `409` | `tasks.read` | Read-only git snapshot of the task workspace: branch, ahead/behind, clean, modified, untracked, last commit. |
 | `GET` | `/tasks/{task_id}/artifacts` | `200`, `404` | `tasks.read` | List artifact metadata. |
 | `GET` | `/tasks/{task_id}/artifacts/{artifact_name}` | `200`, `404` | `tasks.read` | Download one artifact (raw bytes, `text/plain`). |
 | `GET` | `/tasks/{task_id}/session` | `200`, `404` | `tasks.read` | Session id, summary, paths, changed files, usage. |
@@ -330,6 +331,18 @@ Read-only preflight; never writes.
 - `404` unknown task. A task without review artifacts returns `[]`. This is
   a read-only projection: it does not start a review, parse the database
   verdict or read a path named inside an artifact.
+
+#### `GET /tasks/{task_id}/git/status`
+
+- Auth: `tasks.read` on `task:<id>`. The workspace resolves like the Git
+  operations do (explicit `workspace` → `execution_context.host_path` →
+  instance default).
+- `200`: `{task_id, workspace, branch, ahead, behind, clean, modified: [],
+  untracked: [], last_commit: {hash, subject, committed_at} | null}`. This
+  is the endpoint a secretary should call (through `call_api`) to answer
+  "what is the state of the working tree" — no diagnostic task needed.
+- Errors: `404` unknown task, `409` no workspace or not a usable git
+  repository.
 
 #### `POST /tasks/{task_id}/interrupt`
 

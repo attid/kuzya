@@ -202,6 +202,25 @@ changes made before the stop are not rolled back — use the Git rollback
 operation afterwards if needed. There is no automatic timeout: stops happen
 only on request.
 
+## Git workspace resolution and outcomes
+
+Workspace resolution for Git and review operations: the task's explicit
+`workspace` first; when the task has none, the directory its execution
+actually used (`metadata.execution_context.host_path`, recorded by the
+worker from the agent profile); the instance default workspace is the last
+resort only — it is a different repository, and a task without a workspace
+never executed there. `GET /tasks/{task_id}/git/status` resolves through
+the same chain and returns a read-only snapshot (branch, ahead/behind,
+clean flag, modified and untracked paths, last commit) — what a secretary
+calls through `call_api` instead of launching a diagnostic task.
+
+Every successful commit/push/rollback — from the durable operation or from
+a Telegram button — records `metadata.git_outcome` on the task:
+`{action, commit_hash, branch, pushed?, ci_status?, message, at, source}`.
+The Telegram bubble and the operations row are both ephemeral from the
+task's perspective; `git_outcome` is what `get_task` and every later audit
+see.
+
 ## Internal review cycle
 
 When the task has `changed_files` and review is required (coding tasks by

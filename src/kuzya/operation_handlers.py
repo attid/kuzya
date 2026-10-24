@@ -53,6 +53,27 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _git_outcome(result: Any, *, source: str, pushed: bool | None = None) -> dict:
+    """The durable record of one Git outcome, stored in task metadata.
+
+    The Telegram bubble and the operations table are both ephemeral from
+    the task's perspective: ``metadata.git_outcome`` is what ``get_task``
+    and every later audit see.
+    """
+    outcome: dict[str, Any] = {
+        "action": result.action,
+        "commit_hash": result.commit_hash,
+        "branch": result.branch,
+        "message": result.message,
+        "at": _utcnow_iso(),
+        "source": source,
+    }
+    if pushed is not None:
+        outcome["pushed"] = pushed
+        outcome["ci_status"] = result.ci_status
+    return outcome
+
+
 def _load_task_context(
     context: OperationContext,
     action: str,
@@ -142,7 +163,15 @@ def git_commit_push_handler(
         raise OperationExecutionError(
             result.message or "git commit/push failed"
         )
-    repository.update(task_id, status="done")
+    repository.update(
+        task_id,
+        status="done",
+        metadata={
+            "git_outcome": _git_outcome(
+                result, source="operation", pushed=push
+            )
+        },
+    )
     return {
         "action": result.action,
         "message": result.message,
@@ -166,7 +195,13 @@ def git_rollback_handler(context: OperationContext) -> dict[str, Any]:
     )
     if not result.success:
         raise OperationExecutionError(result.message or "git rollback failed")
-    repository.update(task_id, status="cancelled")
+    repository.update(
+        task_id,
+        status="cancelled",
+        metadata={
+            "git_outcome": _git_outcome(result, source="operation")
+        },
+    )
     return {
         "action": result.action,
         "message": result.message,

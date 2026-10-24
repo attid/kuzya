@@ -239,3 +239,58 @@ def test_worker_records_waiting_for_input_after_manual_interrupt(
     assert clarification.get("title") == "Задача остановлена вручную"
     # A stop is not a failure: no error is recorded.
     assert not (stored.meta.get("error"))
+
+
+def test_git_status_endpoint_contract(migrated_db: Path, tmp_path: Path) -> None:
+    """GET /tasks/{id}/git/status: snapshot via execution workspace, honest 409."""
+    import subprocess as sp
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sp.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    sp.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True)
+    sp.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    (repo / "f.txt").write_text("x")
+    sp.run(["git", "add", "."], cwd=repo, check=True)
+    sp.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+    (repo / "f.txt").write_text("dirty")
+
+    database = Database.from_path(migrated_db)
+    try:
+        repository = TaskRepository(database)
+        task = repository.create(title="git status target", workspace=None)
+        repository.update(
+            task.id,
+            metadata={
+                "execution_context": {"host_path": str(repo)},
+            },
+        )
+        app = create_app(
+            f"sqlite:///{migrated_db}",
+            api_tokens={ADMIN_TOKEN},
+            permissions=ExecutionPermissions(),
+        )
+        with TestClient(app) as client:
+            response = client.get(
+                f"/tasks/{task.id}/git/status", headers=ADMIN_HEADERS
+            )
+            assert response.status_code == 200
+            body = response.json()
+            assert body["branch"] == "main"
+            assert body["clean"] is False
+            assert body["modified"] == ["f.txt"]
+            assert body["last_commit"]["subject"] == "init"
+
+            # No workspace anywhere: an honest conflict, not a guess.
+            bare = TaskRepository(database).create(title="no ws")
+            conflict = client.get(
+                f"/tasks/{bare.id}/git/status", headers=ADMIN_HEADERS
+            )
+            assert conflict.status_code == 409
+
+            missing = client.get(
+                "/tasks/nope/git/status", headers=ADMIN_HEADERS
+            )
+            assert missing.status_code == 404
+    finally:
+        database.dispose()

@@ -335,3 +335,49 @@ def test_commit_local_all_skipped_is_clear_failure_no_fallback(temp_git_repo: Pa
         check=True, capture_output=True, text=True,
     ).stdout.strip().splitlines()
     assert len(log) == 1  # only the initial commit
+
+
+def _mini_repo(path, *, with_commit=True):
+    import subprocess as sp
+
+    path.mkdir(parents=True, exist_ok=True)
+    sp.run(["git", "init", "-q", "-b", "main"], cwd=path, check=True)
+    sp.run(["git", "config", "user.email", "t@t"], cwd=path, check=True)
+    sp.run(["git", "config", "user.name", "t"], cwd=path, check=True)
+    if with_commit:
+        (path / "README.md").write_text("hi")
+        sp.run(["git", "add", "."], cwd=path, check=True)
+        sp.run(["git", "commit", "-q", "-m", "init"], cwd=path, check=True)
+    return path
+
+
+def test_status_summary_reports_clean_dirty_and_untracked(tmp_path):
+    from kuzya.git_engine import GitEngine
+
+    repo = _mini_repo(tmp_path / "repo")
+    engine = GitEngine(default_workspace=repo)
+
+    clean = engine.status_summary(repo)
+    assert clean["branch"] == "main"
+    assert clean["clean"] is True
+    assert clean["modified"] == [] and clean["untracked"] == []
+    assert clean["last_commit"]["subject"] == "init"
+
+    (repo / "README.md").write_text("changed")
+    (repo / "new.txt").write_text("untracked")
+    dirty = engine.status_summary(repo)
+    assert dirty["clean"] is False
+    assert dirty["modified"] == ["README.md"]
+    assert dirty["untracked"] == ["new.txt"]
+    assert dirty["last_commit"]["hash"] == clean["last_commit"]["hash"]
+
+
+def test_status_summary_raises_outside_a_repository(tmp_path):
+    import pytest
+
+    from kuzya.git_engine import GitEngine
+
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    with pytest.raises(RuntimeError):
+        GitEngine(default_workspace=plain).status_summary(plain)

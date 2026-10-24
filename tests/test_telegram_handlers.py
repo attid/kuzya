@@ -511,7 +511,9 @@ def test_commit_local_force_commits_past_the_gate(
     asyncio.run(on_commit_local_force(callback, client=client, config=config))
 
     engine.commit_local.assert_called_once()
-    client.patch_task.assert_awaited_once_with("task-1", status="done")
+    patch = client.patch_task.await_args
+    assert patch.args == ("task-1",) and patch.kwargs.get("status") == "done"
+    assert (patch.kwargs.get("metadata") or {}).get("git_outcome")["source"] == "telegram"
 
 
 def test_commit_local_without_requires_review_skips_the_gate(
@@ -537,7 +539,9 @@ def test_commit_local_without_requires_review_skips_the_gate(
     asyncio.run(on_commit_local(callback, client=client, config=config))
 
     engine.commit_local.assert_called_once()
-    client.patch_task.assert_awaited_once_with("task-1", status="done")
+    patch = client.patch_task.await_args
+    assert patch.args == ("task-1",) and patch.kwargs.get("status") == "done"
+    assert (patch.kwargs.get("metadata") or {}).get("git_outcome")["source"] == "telegram"
 
 
 def _commit_status_message() -> MagicMock:
@@ -574,7 +578,11 @@ def test_commit_local_reports_in_status_message_and_keeps_card(
     assert "закоммичена" in status_msg.edit_text.await_args.args[0]
     # ...and the task card is redrawn in place, not destroyed.
     redraw.assert_awaited_once()
-    client.patch_task.assert_awaited_once_with("task-1", status="done")
+    patch = client.patch_task.await_args
+    assert patch.kwargs.get("status") == "done"
+    git_outcome = (patch.kwargs.get("metadata") or {}).get("git_outcome")
+    assert git_outcome["commit_hash"] == "abc"
+    assert git_outcome["source"] == "telegram"
 
 
 def test_commit_local_failure_edits_the_same_status_message(

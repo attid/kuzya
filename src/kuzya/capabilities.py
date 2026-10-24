@@ -715,6 +715,17 @@ _ENDPOINT_CAPABILITIES: tuple[Capability, ...] = (
         ),
     ),
     _endpoint(
+        "GET",
+        "/tasks/{task_id}/git/status",
+        action="tasks.read",
+        doc="task-lifecycle.md",
+        summary=(
+            "read-only git snapshot of the task workspace: branch, "
+            "ahead/behind, clean flag, modified and untracked paths, last "
+            "commit"
+        ),
+    ),
+    _endpoint(
         "PATCH",
         "/tasks/{task_id}",
         action="tasks.write",

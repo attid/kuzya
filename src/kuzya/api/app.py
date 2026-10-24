@@ -1413,6 +1413,46 @@ def create_app(
             "usage": provenance.get("usage"),
         }
 
+    @app.get("/tasks/{task_id}/git/status")
+    def get_task_git_status(
+        task_id: str,
+        repository: TaskRepository = Depends(get_repository),
+    ) -> dict[str, Any]:
+        """One read-only git snapshot of the task's workspace.
+
+        The workspace resolves exactly like the Git operations do: the
+        task's explicit ``workspace``, then the directory its execution
+        actually used, then the instance default. Lets the secretary (via
+        ``call_api``) answer "what is the state of the tree" without
+        launching a diagnostic task.
+        """
+        from ..git_engine import GitEngine
+
+        task = repository.get(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        execution_context = (task.meta or {}).get("execution_context") or {}
+        workspace = task.workspace or (
+            str(execution_context["host_path"])
+            if isinstance(execution_context, dict)
+            and execution_context.get("host_path")
+            else None
+        )
+        if not workspace and default_workspace is not None:
+            workspace = str(default_workspace)
+        if not workspace:
+            raise HTTPException(
+                status_code=409,
+                detail=f"no workspace for task {task_id}",
+            )
+        try:
+            summary = GitEngine(default_workspace=workspace).status_summary(
+                workspace
+            )
+        except (RuntimeError, FileNotFoundError, ValueError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return {"task_id": task_id, **summary}
+
     def change_task_subscription(task_id, payload, request, *, cancel=False):
         from ..task_subscriptions import TaskSubscriptions
 
