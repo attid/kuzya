@@ -825,6 +825,13 @@ success the handler marks the task `done` and returns `action`, `message`,
 `commit_hash`, `branch`, `ci_status`, `ci_required`, `pushed` and
 `task_status`.
 
+Workspace resolution for Git and review operations: the task's explicit
+`workspace` first; when the task has none, the directory its execution
+actually used (`metadata.execution_context.host_path`, recorded by the
+worker from the agent profile); the instance default workspace is the last
+resort only — it is a different repository, and a task without a workspace
+never executed there.
+
 ### Clean tree and no-op commit outcomes
 
 A clean working tree does **not** by itself mean `succeeded`. `commit_local`

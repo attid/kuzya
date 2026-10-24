@@ -1044,6 +1044,56 @@ def _review_gate_keyboard(task_id: str, *, push: bool) -> InlineKeyboardMarkup:
     )
 
 
+def _task_workspace(task: Dict[str, Any], config: TelegramConfig) -> str | None:
+    """Where a task's Git operations run: explicit workspace first, then the
+    directory the execution actually used (execution_context.host_path).
+
+    A task created without a workspace still executes in its agent's project
+    directory; falling back to the instance default would commit into a
+    different repository.
+    """
+    if task.get("workspace"):
+        return str(task["workspace"])
+    host_path = (task.get("metadata") or {}).get("execution_context", {}).get(
+        "host_path"
+    )
+    return str(host_path) if host_path else config.default_workspace
+
+
+async def _redraw_task_card(
+    message: Any,
+    client: BackendClient,
+    task_id: str,
+    *,
+    note: str | None = None,
+) -> None:
+    """Redraw the task card in place with a fresh status and buttons.
+
+    Commit and push outcomes are reported in their own status message; the
+    card must not be destroyed by them — it stays a live control surface.
+    """
+    task = await client.get_task(task_id)
+    description = task.get("description") or ""
+    if len(description) > 14000:
+        description = description[:14000] + "\n\n… (описание сокращено)"
+    card_text = (
+        f"📌 **Задача #{task_display_number(task)}**\n"
+        f"Название: **{task['title']}**\n"
+        f"Статус: `{task['status']}`\n"
+        f"Пространство: {task.get('workspace') or '—'}\n\n"
+        f"Описание:\n{description or '_(без описания)'}"
+    )
+    if note:
+        card_text += f"\n\n{note}"
+    await rich_edit_message(
+        message,
+        card_text,
+        reply_markup=task_card_keyboard(
+            task["id"], task["status"], running=_task_is_running(task)
+        ),
+    )
+
+
 async def _commit_local_impl(
     callback: CallbackQuery,
     client: BackendClient,
@@ -1054,7 +1104,7 @@ async def _commit_local_impl(
     task_id = callback.data.split(":")[1]
     await callback.answer("⏳ Выполняется локальный коммит...")
     task = await client.get_task(task_id)
-    ws = task.get("workspace") or config.default_workspace
+    ws = _task_workspace(task, config)
     meta = task.get("metadata") or {}
     if _review_gate_blocked(meta) and not force:
         await callback.message.edit_text(
@@ -1074,6 +1124,7 @@ async def _commit_local_impl(
     changed_files = meta.get("changed_files") or []
     summary = meta.get("summary")
 
+    status_msg = await callback.message.answer("⏳ Локальный коммит...")
     git_engine = GitEngine(default_workspace=ws)
     res = git_engine.commit_local(
         workspace=ws,
@@ -1084,15 +1135,21 @@ async def _commit_local_impl(
     )
     if res.success:
         await client.patch_task(task_id, status="done")
-        await callback.message.edit_text(
+        await status_msg.edit_text(
             f"✅ <b>Задача #{html.escape(task_display_number(task))} закоммичена!</b>\n\n"
             f"Ветка: <code>{html.escape(res.branch or 'HEAD')}</code>\n"
             f"Коммит: <code>{html.escape(res.commit_hash or '—')}</code>\n\n"
             f"<i>{html.escape(res.message)}</i>",
             parse_mode="HTML",
         )
+        await _redraw_task_card(
+            callback.message,
+            client,
+            task_id,
+            note="_✅ Изменения закоммичены локально_",
+        )
     else:
-        await callback.message.answer(
+        await status_msg.edit_text(
             f"⚠️ <b>Ошибка локального коммита по задаче #{html.escape(task_display_number(task))}:</b>\n\n{html.escape(res.message)}",
             parse_mode="HTML",
         )
@@ -1108,7 +1165,7 @@ async def _commit_push_impl(
     task_id = callback.data.split(":")[1]
     await callback.answer("🚀 Запуск коммита, пуша и проверки CI...")
     task = await client.get_task(task_id)
-    ws = task.get("workspace") or config.default_workspace
+    ws = _task_workspace(task, config)
     meta = task.get("metadata") or {}
     if _review_gate_blocked(meta) and not force:
         await callback.message.edit_text(
@@ -1155,6 +1212,12 @@ async def _commit_push_impl(
             f"<i>{html.escape(res.message)}</i>",
             parse_mode="HTML",
         )
+        await _redraw_task_card(
+            callback.message,
+            client,
+            task_id,
+            note="_🚀 Изменения закоммичены и запушены_",
+        )
     else:
         ci_logs_part = f"\n\n<b>Логи сбоя CI:</b>\n<pre>{html.escape(res.ci_logs[:1000])}</pre>" if res.ci_logs else ""
         fix_kb = InlineKeyboardMarkup(
@@ -1173,6 +1236,12 @@ async def _commit_push_impl(
             f"{ci_logs_part}",
             parse_mode="HTML",
             reply_markup=fix_kb,
+        )
+        await _redraw_task_card(
+            callback.message,
+            client,
+            task_id,
+            note="_❌ Пуш или CI не прошли — изменения остались в рабочей папке_",
         )
 
 
@@ -1221,7 +1290,7 @@ async def on_rollback(
     task_id = callback.data.split(":")[1]
     await callback.answer("⏳ Откат изменений...")
     task = await client.get_task(task_id)
-    ws = task.get("workspace") or config.default_workspace
+    ws = _task_workspace(task, config)
     meta = task.get("metadata") or {}
     changed_files = meta.get("changed_files") or []
 

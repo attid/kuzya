@@ -744,3 +744,70 @@ def test_commit_operation_blocked_without_approved_review(
         assert tasks.get(approved_id).status == "done"
     finally:
         database.dispose()
+
+
+def test_git_and_review_operations_inherit_execution_workspace(
+    migrated_db: pathlib.Path,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A task without an explicit workspace runs Git in the directory its
+    execution actually used — never in the instance default repository."""
+    from unittest.mock import MagicMock
+
+    from kuzya.operation_handlers import git_commit_push_handler
+    from kuzya.storage import TaskRepository
+
+    database = Database.from_path(migrated_db)
+    try:
+        task_id = TaskRepository(database).create(
+            title="no explicit workspace",
+            workspace=None,
+            metadata={
+                "changed_files": ["bot/a.py"],
+                "execution_context": {
+                    "host_path": "/ws/agent-project",
+                },
+            },
+        ).id
+
+        engine = MagicMock()
+        engine.commit_local.return_value = MagicMock(
+            success=True,
+            action="commit_local",
+            message="ok",
+            commit_hash="abc",
+        )
+        monkeypatch.setattr(
+            "kuzya.operation_handlers.GitEngine",
+            MagicMock(return_value=engine),
+        )
+
+        from kuzya.operation_worker import (
+            OperationContext,
+            OperationInstanceContext,
+        )
+
+        context = OperationContext(
+            operation_id="op-ws",
+            kind=OPERATION_KIND_GIT_COMMIT_PUSH,
+            target_id=task_id,
+            input={"push": False},
+            attempt_count=1,
+            metadata={},
+            instance=OperationInstanceContext(
+                database=database,
+                artifact_root=tmp_path / "operations",
+                default_workspace=pathlib.Path("/ws/instance-default"),
+            ),
+        )
+        outcome = git_commit_push_handler(context)
+        assert outcome["commit_hash"] == "abc"
+        # The engine ran in the execution directory, not the default.
+        engine.commit_local.assert_called_once()
+        assert (
+            engine.commit_local.call_args.kwargs.get("workspace")
+            == "/ws/agent-project"
+        )
+    finally:
+        database.dispose()

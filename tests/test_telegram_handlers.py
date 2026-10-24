@@ -496,6 +496,10 @@ def test_commit_local_force_commits_past_the_gate(
     callback, client, config = _commit_setup(
         {"requires_review": True}, "commit_local_force:task-1"
     )
+    callback.message.answer = AsyncMock(return_value=_commit_status_message())
+    monkeypatch.setattr(
+        "kuzya.telegram.handlers._redraw_task_card", AsyncMock()
+    )
     engine = MagicMock()
     engine.commit_local.return_value = MagicMock(
         success=True, message="ok", branch="main", commit_hash="abc"
@@ -518,6 +522,10 @@ def test_commit_local_without_requires_review_skips_the_gate(
     callback, client, config = _commit_setup(
         {"requires_review": False}, "commit_local:task-1"
     )
+    callback.message.answer = AsyncMock(return_value=_commit_status_message())
+    monkeypatch.setattr(
+        "kuzya.telegram.handlers._redraw_task_card", AsyncMock()
+    )
     engine = MagicMock()
     engine.commit_local.return_value = MagicMock(
         success=True, message="ok", branch="main", commit_hash="abc"
@@ -530,3 +538,88 @@ def test_commit_local_without_requires_review_skips_the_gate(
 
     engine.commit_local.assert_called_once()
     client.patch_task.assert_awaited_once_with("task-1", status="done")
+
+
+def _commit_status_message() -> MagicMock:
+    status = MagicMock()
+    status.edit_text = AsyncMock()
+    return status
+
+
+def test_commit_local_reports_in_status_message_and_keeps_card(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kuzya.telegram.handlers import on_commit_local
+
+    callback, client, config = _commit_setup(
+        {"requires_review": False}, "commit_local:task-1"
+    )
+    status_msg = _commit_status_message()
+    callback.message.answer = AsyncMock(return_value=status_msg)
+    engine = MagicMock()
+    engine.commit_local.return_value = MagicMock(
+        success=True, message="ok", branch="main", commit_hash="abc"
+    )
+    monkeypatch.setattr(
+        "kuzya.telegram.handlers.GitEngine", MagicMock(return_value=engine)
+    )
+    redraw = AsyncMock()
+    monkeypatch.setattr("kuzya.telegram.handlers._redraw_task_card", redraw)
+
+    asyncio.run(on_commit_local(callback, client=client, config=config))
+
+    # The outcome lands in its own status message...
+    callback.message.answer.assert_awaited_once()
+    assert "Локальный коммит" in callback.message.answer.await_args.args[0]
+    assert "закоммичена" in status_msg.edit_text.await_args.args[0]
+    # ...and the task card is redrawn in place, not destroyed.
+    redraw.assert_awaited_once()
+    client.patch_task.assert_awaited_once_with("task-1", status="done")
+
+
+def test_commit_local_failure_edits_the_same_status_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kuzya.telegram.handlers import on_commit_local
+
+    callback, client, config = _commit_setup(
+        {"requires_review": False}, "commit_local:task-1"
+    )
+    status_msg = _commit_status_message()
+    callback.message.answer = AsyncMock(return_value=status_msg)
+    engine = MagicMock()
+    engine.commit_local.return_value = MagicMock(
+        success=False, message="Ни один путь не годен для стейджинга"
+    )
+    monkeypatch.setattr(
+        "kuzya.telegram.handlers.GitEngine", MagicMock(return_value=engine)
+    )
+
+    asyncio.run(on_commit_local(callback, client=client, config=config))
+
+    assert "Ошибка" in status_msg.edit_text.await_args.args[0]
+    client.patch_task.assert_not_awaited()
+
+
+def test_task_workspace_prefers_execution_context_host_path() -> None:
+    from kuzya.telegram.handlers import _task_workspace
+
+    config = MagicMock()
+    config.default_workspace = "/ws/default"
+
+    explicit = _task_workspace(
+        {"workspace": "/ws/explicit",
+         "metadata": {"execution_context": {"host_path": "/ws/agent"}}},
+        config,
+    )
+    assert explicit == "/ws/explicit"
+
+    inherited = _task_workspace(
+        {"workspace": None,
+         "metadata": {"execution_context": {"host_path": "/ws/agent"}}},
+        config,
+    )
+    assert inherited == "/ws/agent"
+
+    fallback = _task_workspace({"workspace": None, "metadata": {}}, config)
+    assert fallback == "/ws/default"

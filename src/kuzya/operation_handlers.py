@@ -66,7 +66,19 @@ def _load_task_context(
     task = repository.get(task_id)
     if task is None:
         raise OperationExecutionError(f"task not found: {task_id}")
-    workspace = task.workspace
+    # A task created without an explicit workspace still executes in its
+    # agent's project directory — the worker records that path in
+    # execution_context.host_path. Git and review actions must resolve
+    # through it so the commit lands next to the changes; the instance
+    # default workspace is a different repository and stays the last
+    # resort only.
+    execution_context = (task.meta or {}).get("execution_context") or {}
+    workspace = task.workspace or (
+        str(execution_context["host_path"])
+        if isinstance(execution_context, dict)
+        and execution_context.get("host_path")
+        else None
+    )
     if not workspace and context.instance.default_workspace is not None:
         workspace = str(context.instance.default_workspace)
     if not workspace:
@@ -181,7 +193,17 @@ def review_operation_handler(context: OperationContext) -> dict[str, Any]:
     if task is None:
         raise OperationExecutionError(f"task not found: {task_id}")
 
-    workspace = task.workspace
+    # Same resolution rule as the Git actions: a task without an explicit
+    # workspace executes in its agent's project directory, recorded in
+    # execution_context.host_path. Reviewing the instance default instead
+    # would read a different repository than the one the agent changed.
+    execution_context = (task.meta or {}).get("execution_context") or {}
+    workspace = task.workspace or (
+        str(execution_context["host_path"])
+        if isinstance(execution_context, dict)
+        and execution_context.get("host_path")
+        else None
+    )
     if not workspace and context.instance.default_workspace is not None:
         workspace = str(context.instance.default_workspace)
     if not workspace:
