@@ -6,6 +6,8 @@ import asyncio
 import pathlib
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from aiogram.types import CallbackQuery, Chat, Message, User
 
 from kuzya.telegram.config import TelegramConfig
@@ -440,3 +442,91 @@ def test_switch_task_button_binds_task_context(
     assert state.active_conversation_id == "conv-a"
     prompt = callback.message.answer.call_args.args[0]
     assert "#conv-a" in prompt
+
+
+# -- commit buttons honour the review gate -------------------------------
+
+
+def _commit_setup(task_meta: dict, data: str):
+    from unittest.mock import patch
+
+    user = _user()
+    callback = _callback(data, user=user)
+    callback.message.edit_text = AsyncMock()
+    client = MagicMock()
+    client.get_task = AsyncMock(
+        return_value={
+            "id": "task-1",
+            "number": 7,
+            "title": "T",
+            "workspace": "/ws/a",
+            "metadata": task_meta,
+        }
+    )
+    client.patch_task = AsyncMock()
+    config = MagicMock()
+    config.default_workspace = "/ws/default"
+    return callback, client, config
+
+
+def test_commit_local_blocked_without_approved_review() -> None:
+    from kuzya.telegram.handlers import on_commit_local
+
+    callback, client, config = _commit_setup(
+        {"requires_review": True, "review": {"approved": False}},
+        "commit_local:task-1",
+    )
+
+    asyncio.run(on_commit_local(callback, client=client, config=config))
+
+    call = callback.message.edit_text.await_args
+    assert "ревью не одобрено" in call.args[0]
+    assert (
+        call.kwargs["reply_markup"].inline_keyboard[0][0].callback_data
+        == "commit_local_force:task-1"
+    )
+    client.patch_task.assert_not_awaited()
+
+
+def test_commit_local_force_commits_past_the_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kuzya.telegram.handlers import on_commit_local_force
+
+    callback, client, config = _commit_setup(
+        {"requires_review": True}, "commit_local_force:task-1"
+    )
+    engine = MagicMock()
+    engine.commit_local.return_value = MagicMock(
+        success=True, message="ok", branch="main", commit_hash="abc"
+    )
+    monkeypatch.setattr(
+        "kuzya.telegram.handlers.GitEngine", MagicMock(return_value=engine)
+    )
+
+    asyncio.run(on_commit_local_force(callback, client=client, config=config))
+
+    engine.commit_local.assert_called_once()
+    client.patch_task.assert_awaited_once_with("task-1", status="done")
+
+
+def test_commit_local_without_requires_review_skips_the_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kuzya.telegram.handlers import on_commit_local
+
+    callback, client, config = _commit_setup(
+        {"requires_review": False}, "commit_local:task-1"
+    )
+    engine = MagicMock()
+    engine.commit_local.return_value = MagicMock(
+        success=True, message="ok", branch="main", commit_hash="abc"
+    )
+    monkeypatch.setattr(
+        "kuzya.telegram.handlers.GitEngine", MagicMock(return_value=engine)
+    )
+
+    asyncio.run(on_commit_local(callback, client=client, config=config))
+
+    engine.commit_local.assert_called_once()
+    client.patch_task.assert_awaited_once_with("task-1", status="done")

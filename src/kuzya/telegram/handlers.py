@@ -1019,17 +1019,58 @@ async def on_interrupt_task(
     )
 
 
-@router.callback_query(F.data.startswith("commit_local:"))
-async def on_commit_local(
+def _review_gate_blocked(meta: Dict[str, Any]) -> bool:
+    """The task demands review but no approved verdict is recorded.
+
+    Mirrors the ``git.commit_push`` operation gate: the invariant
+    ``requires_review`` ⇒ approved must hold on every path to ``done``,
+    including the Telegram commit buttons that bypass the operation queue.
+    """
+    review = meta.get("review") if isinstance(meta.get("review"), dict) else {}
+    return bool(meta.get("requires_review")) and not review.get("approved")
+
+
+def _review_gate_keyboard(task_id: str, *, push: bool) -> InlineKeyboardMarkup:
+    action = "commit_push_force" if push else "commit_local_force"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⏭ Закоммитить без ревью",
+                    callback_data=f"{action}:{task_id}",
+                )
+            ]
+        ]
+    )
+
+
+async def _commit_local_impl(
     callback: CallbackQuery,
     client: BackendClient,
     config: TelegramConfig,
+    *,
+    force: bool = False,
 ) -> None:
     task_id = callback.data.split(":")[1]
     await callback.answer("⏳ Выполняется локальный коммит...")
     task = await client.get_task(task_id)
     ws = task.get("workspace") or config.default_workspace
     meta = task.get("metadata") or {}
+    if _review_gate_blocked(meta) and not force:
+        await callback.message.edit_text(
+            f"⏸ <b>Задача #{html.escape(task_display_number(task))}: ревью не одобрено</b>\n\n"
+            "Для задачи включено обязательное Code Review, но подтверждённого "
+            "вердикта нет — коммит заблокирован.\n\n"
+            "<i>Можно закоммитить принудительно; это осознанный обход ревью "
+            "и он попадёт в журнал.</i>",
+            parse_mode="HTML",
+            reply_markup=_review_gate_keyboard(task_id, push=False),
+        )
+        return
+    if force:
+        logger.info(
+            "commit_local forced past an unapproved review: task=%s", task_id
+        )
     changed_files = meta.get("changed_files") or []
     summary = meta.get("summary")
 
@@ -1057,17 +1098,33 @@ async def on_commit_local(
         )
 
 
-@router.callback_query(F.data.startswith("commit_push:"))
-async def on_commit_push(
+async def _commit_push_impl(
     callback: CallbackQuery,
     client: BackendClient,
     config: TelegramConfig,
+    *,
+    force: bool = False,
 ) -> None:
     task_id = callback.data.split(":")[1]
     await callback.answer("🚀 Запуск коммита, пуша и проверки CI...")
     task = await client.get_task(task_id)
     ws = task.get("workspace") or config.default_workspace
     meta = task.get("metadata") or {}
+    if _review_gate_blocked(meta) and not force:
+        await callback.message.edit_text(
+            f"⏸ <b>Задача #{html.escape(task_display_number(task))}: ревью не одобрено</b>\n\n"
+            "Для задачи включено обязательное Code Review, но подтверждённого "
+            "вердикта нет — коммит и пуш заблокированы.\n\n"
+            "<i>Можно закоммитить принудительно; это осознанный обход ревью "
+            "и он попадёт в журнал.</i>",
+            parse_mode="HTML",
+            reply_markup=_review_gate_keyboard(task_id, push=True),
+        )
+        return
+    if force:
+        logger.info(
+            "commit_push forced past an unapproved review: task=%s", task_id
+        )
     changed_files = meta.get("changed_files") or []
     summary = meta.get("summary")
 
@@ -1117,6 +1174,42 @@ async def on_commit_push(
             parse_mode="HTML",
             reply_markup=fix_kb,
         )
+
+
+@router.callback_query(F.data.startswith("commit_local:"))
+async def on_commit_local(
+    callback: CallbackQuery,
+    client: BackendClient,
+    config: TelegramConfig,
+) -> None:
+    await _commit_local_impl(callback, client, config, force=False)
+
+
+@router.callback_query(F.data.startswith("commit_local_force:"))
+async def on_commit_local_force(
+    callback: CallbackQuery,
+    client: BackendClient,
+    config: TelegramConfig,
+) -> None:
+    await _commit_local_impl(callback, client, config, force=True)
+
+
+@router.callback_query(F.data.startswith("commit_push:"))
+async def on_commit_push(
+    callback: CallbackQuery,
+    client: BackendClient,
+    config: TelegramConfig,
+) -> None:
+    await _commit_push_impl(callback, client, config, force=False)
+
+
+@router.callback_query(F.data.startswith("commit_push_force:"))
+async def on_commit_push_force(
+    callback: CallbackQuery,
+    client: BackendClient,
+    config: TelegramConfig,
+) -> None:
+    await _commit_push_impl(callback, client, config, force=True)
 
 
 @router.callback_query(F.data.startswith("rollback:"))
