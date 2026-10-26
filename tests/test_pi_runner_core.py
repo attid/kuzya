@@ -554,3 +554,43 @@ class RunnerTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class RuntimePathTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.repo = self.root / 'repo'
+        self.repo.mkdir()
+        self.state = self.root / 'state'
+
+    def config(self, **overrides):
+        data = dict(agent_id='developer', project=str(self.repo), state_dir=str(self.state),
+                    pi_command=['/usr/bin/true'], runtime_paths=[], model='test', provider='test')
+        data.update(overrides)
+        p = self.root / 'config.json'
+        p.write_text(json.dumps(data))
+        return Config.load(p)
+
+    def test_runtime_paths_land_on_path(self):
+        # An ro-bound uv binary is unreachable in the cleared sandbox
+        # environment unless its own directory joins PATH.
+        uv = self.root / 'tools' / 'bin' / 'uv'
+        uv.parent.mkdir(parents=True)
+        uv.write_text('#!/bin/sh\n')
+        prefix = self.root / 'python-prefix'
+        (prefix / 'bin').mkdir(parents=True)
+        argv = sandbox_command(
+            self.config(runtime_paths=[str(uv), str(prefix)]),
+            self.state / 'home',
+            self.state / 'session',
+        )
+        path = argv[argv.index('PATH') + 1]
+        parts = path.split(':')
+        self.assertIn(str(uv.parent), parts)
+        self.assertIn(str(prefix / 'bin'), parts)
+        self.assertIn(str(prefix), parts)
+        self.assertIn('/usr/bin', parts)
+        # No duplicates pollute the value.
+        self.assertEqual(len(parts), len(set(parts)))

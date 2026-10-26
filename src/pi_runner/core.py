@@ -253,7 +253,19 @@ def sandbox_command(config, home, session, egress_proxy_uds=None):
         # Linked worktrees need their external common directory exposed. Do not
         # silently mount it, since it may expose other projects or credentials.
         raise RunnerError('Linked worktree .git file is unsupported; use a standalone checkout')
-    path = ':'.join(dict.fromkeys([str(Path(c.pi_command[0]).parent), '/usr/bin', '/bin']))
+    # The sandbox clears the environment, so every ro-bound runtime binary
+    # is unreachable unless its own directory is on PATH: an ro-bound uv
+    # under ~/.local/bin must not force agents to invent PATH prefixes.
+    path_parts = [str(Path(c.pi_command[0]).parent)]
+    for runtime_path in c.runtime_paths:
+        entry = Path(runtime_path)
+        if entry.is_dir():
+            path_parts.append(str(entry))
+            path_parts.append(str(entry / 'bin'))
+        else:
+            path_parts.append(str(entry.parent))
+    path_parts += ['/usr/bin', '/bin']
+    path = ':'.join(dict.fromkeys(path_parts))
     argv += ['--setenv', 'HOME', '/home/runner', '--setenv', 'PATH', path,
              '--setenv', 'LANG', 'C.UTF-8', '--setenv', 'TMPDIR', '/tmp',
              '--setenv', 'PI_CODING_AGENT_DIR', '/home/runner/.pi/agent',

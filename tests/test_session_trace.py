@@ -659,3 +659,81 @@ def test_analysis_executor_passes_task_trace_to_analyzer(
         assert reports[0].evidence["trace"]["status"] == "available"
     finally:
         database.dispose()
+
+
+def test_trace_deduplicates_artifact_copy_of_session_journal(
+    migrated_db: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """The worker's artifact copy (same size, same mtime) must not double the trace."""
+    import shutil
+
+    database = Database.from_path(migrated_db)
+    try:
+        root, session_path, events_path, provenance = _successful_artifacts(
+            tmp_path
+        )
+        task_dir = session_path.parents[3]
+        tasks = TaskRepository(database)
+        task = tasks.create(
+            id="task-one",
+            title="Copy target",
+            metadata={"provenance": provenance},
+        )
+
+        # Without the copy there is exactly one session source.
+        single = build_task_trace(task, [root])
+        session_sources = [
+            source
+            for source in single["sources"]
+            if source["kind"] == SESSION_FILENAME
+        ]
+        assert len(session_sources) == 1
+
+        # The worker takes the artifact copy with shutil.copy2, which
+        # preserves the mtime — discovery then finds the same journal
+        # under two different paths.
+        artifact_copy = task_dir / "artifacts" / SESSION_FILENAME
+        artifact_copy.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(session_path, artifact_copy)
+        assert artifact_copy.stat().st_mtime_ns == session_path.stat().st_mtime_ns
+
+        doubled = build_task_trace(task, [root])
+        session_sources = [
+            source
+            for source in doubled["sources"]
+            if source["kind"] == SESSION_FILENAME
+        ]
+        assert len(session_sources) == 1
+        assert session_sources[0]["origin"] == "provenance"
+        # Usage and message counts stay single, not doubled.
+        assert doubled["usage"] == single["usage"]
+        assert (
+            doubled["session"]["message_counts"]
+            == single["session"]["message_counts"]
+        )
+
+        # A journal that kept growing after the copy is genuinely two
+        # different files: both sources stay.
+        with session_path.open("a", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "type": "message",
+                        "timestamp": "2026-02-01T10:00:07Z",
+                        "message": {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "more"}],
+                        },
+                    }
+                )
+                + "\n"
+            )
+        diverged = build_task_trace(task, [root])
+        session_sources = [
+            source
+            for source in diverged["sources"]
+            if source["kind"] == SESSION_FILENAME
+        ]
+        assert len(session_sources) == 2
+    finally:
+        database.dispose()

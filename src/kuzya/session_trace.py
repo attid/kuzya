@@ -896,6 +896,21 @@ def _discover_task_artifacts(
     return discovered, limit_reached
 
 
+def _file_fingerprint(path: Path) -> tuple[int, int] | None:
+    """Content identity of one trace source: size plus mtime.
+
+    ``shutil.copy2`` preserves the mtime, so an artifact copy of a session
+    journal and its original share the fingerprint, while a journal that
+    kept growing after the copy was taken does not. ``None`` when the file
+    cannot be stat'ed — such sources are never deduplicated away.
+    """
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_size, stat.st_mtime_ns)
+
+
 def _read_records(
     path: Path,
     *,
@@ -1143,14 +1158,31 @@ def build_task_trace(
         EVENTS_FILENAME: set(),
     }
     for kind in TRACE_KINDS:
+        # The same journal often exists twice: the live file under the
+        # agent state directory (provenance) and the artifact copy the
+        # worker takes after execution (discovered). Different paths, so
+        # path dedup alone lets every record, error and token enter the
+        # trace twice. A byte-identical copy (same size and mtime, what
+        # shutil.copy2 produces) is dropped; a file that diverged after
+        # the copy keeps both sources.
+        fingerprints: set[tuple[int, int]] = set()
         for path, origin in accepted[kind]:
             if path not in seen_paths[kind]:
                 seen_paths[kind].add(path)
                 all_paths[kind].append((path, origin))
+                fingerprint = _file_fingerprint(path)
+                if fingerprint is not None:
+                    fingerprints.add(fingerprint)
         for path in discovered[kind]:
-            if path not in seen_paths[kind]:
-                seen_paths[kind].add(path)
-                all_paths[kind].append((path, "discovered"))
+            if path in seen_paths[kind]:
+                continue
+            fingerprint = _file_fingerprint(path)
+            if fingerprint is not None and fingerprint in fingerprints:
+                continue
+            seen_paths[kind].add(path)
+            all_paths[kind].append((path, "discovered"))
+            if fingerprint is not None:
+                fingerprints.add(fingerprint)
 
     collector = _TraceCollector()
     sources: list[dict[str, Any]] = []
